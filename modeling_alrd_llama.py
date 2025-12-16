@@ -965,6 +965,8 @@ class ALRDLinear_KIVI_Key(nn.Module):
         self.BLinear = nn.Linear(in_features, rank, bias=False)
         self.ALinear = nn.Linear(rank, out_features, bias=bias)
         self.rank = rank
+        self.in_features = in_features
+        self.out_features = out_features
         
         # KIVI-style quantizer: per-channel for Key
         self.kivi_quantizer = KIVIMixedQuantizer(
@@ -976,6 +978,68 @@ class ALRDLinear_KIVI_Key(nn.Module):
         
         # KIVI-style quantizer (per-channel for Key)
         self.quantizer = KIVIKeyQuantizer(n_bits=k_bits, group_size=group_size)
+        
+        # For Hadamard transform
+        self.rank_lists = self._split_rank_for_hada(rank)
+    
+    def _split_rank_for_hada(self, rank):
+        """Split rank into chunks suitable for Hadamard transform (power of 2)."""
+        def is_pow2(n):
+            return (n & (n - 1) == 0) and (n > 0)
+        
+        hada_list = []
+        rank_lists = [1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1]
+        res_rank = rank
+        for item in rank_lists:
+            if item == 1 or res_rank == 1 or res_rank == 0:
+                break
+            if is_pow2(res_rank):
+                hada_list.append(res_rank)
+                break
+            while res_rank >= item:
+                times = res_rank // item
+                if is_pow2(times):
+                    hada_list.append(times * item)
+                    res_rank = res_rank % item
+                else:
+                    hada_list.append(item)
+                    res_rank = res_rank - item
+        return hada_list
+    
+    def fuse_hadamard(self):
+        """Apply Hadamard transform to BLinear and ALinear weights for better quantization."""
+        def hadamard_transform(x):
+            n = x.size(1)
+            if n & (n - 1) != 0:
+                raise ValueError("Input size must be a power of 2.")
+            H = torch.tensor([[1, 1], [1, -1]], dtype=x.dtype).to(x.device)
+            for i in range(1, int(n.bit_length()-1)):
+                H = torch.kron(H, torch.tensor([[1, 1], [1, -1]], dtype=x.dtype).to(H.device))
+            return torch.matmul(x, H) / torch.tensor(n, dtype=x.dtype).sqrt()
+        
+        VT_weight = self.BLinear.weight.data
+        U_weight = self.ALinear.weight.data
+        total_rank = 0
+        
+        print(f"ALRDLinear_KIVI_Key fuse_hadamard: rank={self.rank}, rank_lists={self.rank_lists}")
+        
+        for rank in self.rank_lists:
+            # Transform BLinear (VT)
+            VT_chunk = VT_weight[total_rank:total_rank + rank, :].contiguous()
+            VT_chunk = VT_chunk.transpose(0, 1).contiguous()
+            VT_chunk = VT_chunk.view(-1, VT_chunk.shape[-1]).contiguous()
+            VT_chunk = hadamard_transform(VT_chunk)
+            self.BLinear.weight.data[total_rank:total_rank + rank, :] = VT_chunk.t()
+            
+            # Transform ALinear (U)
+            U_chunk = U_weight[:, total_rank:total_rank + rank].contiguous()
+            U_chunk = U_chunk.view(-1, U_chunk.shape[-1]).contiguous()
+            U_chunk = hadamard_transform(U_chunk)
+            self.ALinear.weight.data[:, total_rank:total_rank + rank] = U_chunk.view_as(
+                self.ALinear.weight.data[:, total_rank:total_rank + rank]
+            )
+            
+            total_rank += rank
     
     def quantize_latent(self, latents: torch.Tensor) -> torch.Tensor:
         """Simple quantization without residual."""
@@ -1018,6 +1082,8 @@ class ALRDLinear_KIVI_Value(nn.Module):
         self.BLinear = nn.Linear(in_features, rank, bias=False)
         self.ALinear = nn.Linear(rank, out_features, bias=bias)
         self.rank = rank
+        self.in_features = in_features
+        self.out_features = out_features
         
         # KIVI-style quantizer: per-token for Value
         self.kivi_quantizer = KIVIMixedQuantizer(
@@ -1029,6 +1095,68 @@ class ALRDLinear_KIVI_Value(nn.Module):
         
         # KIVI-style quantizer (per-token for Value)
         self.quantizer = KIVIValueQuantizer(n_bits=v_bits, group_size=group_size)
+        
+        # For Hadamard transform
+        self.rank_lists = self._split_rank_for_hada(rank)
+    
+    def _split_rank_for_hada(self, rank):
+        """Split rank into chunks suitable for Hadamard transform (power of 2)."""
+        def is_pow2(n):
+            return (n & (n - 1) == 0) and (n > 0)
+        
+        hada_list = []
+        rank_lists = [1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1]
+        res_rank = rank
+        for item in rank_lists:
+            if item == 1 or res_rank == 1 or res_rank == 0:
+                break
+            if is_pow2(res_rank):
+                hada_list.append(res_rank)
+                break
+            while res_rank >= item:
+                times = res_rank // item
+                if is_pow2(times):
+                    hada_list.append(times * item)
+                    res_rank = res_rank % item
+                else:
+                    hada_list.append(item)
+                    res_rank = res_rank - item
+        return hada_list
+    
+    def fuse_hadamard(self):
+        """Apply Hadamard transform to BLinear and ALinear weights for better quantization."""
+        def hadamard_transform(x):
+            n = x.size(1)
+            if n & (n - 1) != 0:
+                raise ValueError("Input size must be a power of 2.")
+            H = torch.tensor([[1, 1], [1, -1]], dtype=x.dtype).to(x.device)
+            for i in range(1, int(n.bit_length()-1)):
+                H = torch.kron(H, torch.tensor([[1, 1], [1, -1]], dtype=x.dtype).to(H.device))
+            return torch.matmul(x, H) / torch.tensor(n, dtype=x.dtype).sqrt()
+        
+        VT_weight = self.BLinear.weight.data
+        U_weight = self.ALinear.weight.data
+        total_rank = 0
+        
+        print(f"ALRDLinear_KIVI_Value fuse_hadamard: rank={self.rank}, rank_lists={self.rank_lists}")
+        
+        for rank in self.rank_lists:
+            # Transform BLinear (VT)
+            VT_chunk = VT_weight[total_rank:total_rank + rank, :].contiguous()
+            VT_chunk = VT_chunk.transpose(0, 1).contiguous()
+            VT_chunk = VT_chunk.view(-1, VT_chunk.shape[-1]).contiguous()
+            VT_chunk = hadamard_transform(VT_chunk)
+            self.BLinear.weight.data[total_rank:total_rank + rank, :] = VT_chunk.t()
+            
+            # Transform ALinear (U)
+            U_chunk = U_weight[:, total_rank:total_rank + rank].contiguous()
+            U_chunk = U_chunk.view(-1, U_chunk.shape[-1]).contiguous()
+            U_chunk = hadamard_transform(U_chunk)
+            self.ALinear.weight.data[:, total_rank:total_rank + rank] = U_chunk.view_as(
+                self.ALinear.weight.data[:, total_rank:total_rank + rank]
+            )
+            
+            total_rank += rank
     
     def quantize_latent(self, latents: torch.Tensor) -> torch.Tensor:
         """Simple quantization without residual."""
@@ -1090,6 +1218,9 @@ class ALRDLinear_KIVI_Value_Mixed(nn.Module):
         self.BLinear = nn.Linear(in_features, out_features, bias=False)
         self.ALinear = nn.Linear(out_features, out_features, bias=bias)
         
+        # For Hadamard transform - use out_features since that's the latent dimension
+        self.rank_lists = self._split_rank_for_hada(out_features)
+        
         # Calculate compression ratios
         self.lowrank_ratio = rank / out_features  # r2
         self.target_ratio = target_ratio  # r1
@@ -1128,6 +1259,65 @@ class ALRDLinear_KIVI_Value_Mixed(nn.Module):
         print(f"ALRDLinear_KIVI_Value_Mixed: out_features={out_features}, "
               f"n_4bit={self.n_4bit}, n_2bit={self.n_2bit}, "
               f"avg_bits={self.avg_bits:.2f}, final_ratio={self.final_ratio:.4f}")
+    
+    def _split_rank_for_hada(self, rank):
+        """Split rank into chunks suitable for Hadamard transform (power of 2)."""
+        def is_pow2(n):
+            return (n & (n - 1) == 0) and (n > 0)
+        
+        hada_list = []
+        rank_lists = [1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1]
+        res_rank = rank
+        for item in rank_lists:
+            if item == 1 or res_rank == 1 or res_rank == 0:
+                break
+            if is_pow2(res_rank):
+                hada_list.append(res_rank)
+                break
+            while res_rank >= item:
+                times = res_rank // item
+                if is_pow2(times):
+                    hada_list.append(times * item)
+                    res_rank = res_rank % item
+                else:
+                    hada_list.append(item)
+                    res_rank = res_rank - item
+        return hada_list
+    
+    def fuse_hadamard(self):
+        """Apply Hadamard transform to BLinear and ALinear weights for better quantization."""
+        def hadamard_transform(x):
+            n = x.size(1)
+            if n & (n - 1) != 0:
+                raise ValueError("Input size must be a power of 2.")
+            H = torch.tensor([[1, 1], [1, -1]], dtype=x.dtype).to(x.device)
+            for i in range(1, int(n.bit_length()-1)):
+                H = torch.kron(H, torch.tensor([[1, 1], [1, -1]], dtype=x.dtype).to(H.device))
+            return torch.matmul(x, H) / torch.tensor(n, dtype=x.dtype).sqrt()
+        
+        VT_weight = self.BLinear.weight.data
+        U_weight = self.ALinear.weight.data
+        total_rank = 0
+        
+        print(f"ALRDLinear_KIVI_Value_Mixed fuse_hadamard: out_features={self.out_features}, rank_lists={self.rank_lists}")
+        
+        for rank in self.rank_lists:
+            # Transform BLinear (VT)
+            VT_chunk = VT_weight[total_rank:total_rank + rank, :].contiguous()
+            VT_chunk = VT_chunk.transpose(0, 1).contiguous()
+            VT_chunk = VT_chunk.view(-1, VT_chunk.shape[-1]).contiguous()
+            VT_chunk = hadamard_transform(VT_chunk)
+            self.BLinear.weight.data[total_rank:total_rank + rank, :] = VT_chunk.t()
+            
+            # Transform ALinear (U)
+            U_chunk = U_weight[:, total_rank:total_rank + rank].contiguous()
+            U_chunk = U_chunk.view(-1, U_chunk.shape[-1]).contiguous()
+            U_chunk = hadamard_transform(U_chunk)
+            self.ALinear.weight.data[:, total_rank:total_rank + rank] = U_chunk.view_as(
+                self.ALinear.weight.data[:, total_rank:total_rank + rank]
+            )
+            
+            total_rank += rank
     
     def quantize_latent(self, latents: torch.Tensor) -> torch.Tensor:
         """
