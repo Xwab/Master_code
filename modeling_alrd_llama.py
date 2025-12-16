@@ -27,9 +27,14 @@ logger = logging.get_logger(__name__)
 class CustomLlamaSdpaAttention(LlamaSdpaAttention):
     def __init__(self, config, layer_idx=None):
         super().__init__(config, layer_idx)
-        self.quantizer = Quantizer(n_bits=8, group_size= 0, sym = True, clip_ratio = 1.0)
-        #self.q_max = (2**(32-1)-1)
-        #self.q_min = (-2**(32-1))
+        # KIVI-style quantizer for ALinear weight
+        # Use per-channel quantization (each output channel has its own scale)
+        self.a_weight_bits = getattr(config, 'a_weight_bits', 8)
+        self.a_weight_group_size = getattr(config, 'a_weight_group_size', 128)
+        self.quantizer = KIVIValueQuantizer(
+            n_bits=self.a_weight_bits, 
+            group_size=self.a_weight_group_size
+        )
 
     def forward(
             self,
@@ -162,14 +167,21 @@ class CustomLlamaFlashAttention2(LlamaFlashAttention2):
     flash attention and deal with padding tokens in case the input contains any of them.
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, config, layer_idx=None):
+        super().__init__(config, layer_idx)
 
         # TODO: Should be removed once Flash Attention for RoCm is bumped to 2.1.
         # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignement, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
         # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).
         self._flash_attn_uses_top_left_mask = True#not is_flash_attn_greater_or_equal_2_10()
-        self.quantizer = Quantizer(n_bits=8, group_size= 0, sym = True, clip_ratio = 1.0)
+        
+        # KIVI-style quantizer for ALinear weight
+        self.a_weight_bits = getattr(config, 'a_weight_bits', 8)
+        self.a_weight_group_size = getattr(config, 'a_weight_group_size', 128)
+        self.quantizer = KIVIValueQuantizer(
+            n_bits=self.a_weight_bits, 
+            group_size=self.a_weight_group_size
+        )
     def forward(
         self,
         hidden_states: torch.Tensor,

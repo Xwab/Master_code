@@ -27,6 +27,10 @@ class ALRDLlamaConfig(LlamaConfig):
             If not specified, uses default_value_target_ratio
         default_value_target_ratio: Default target compression ratio for Value (default: 0.25)
         
+        # ALinear weight quantization (KIVI-style)
+        a_weight_bits: Number of bits for ALinear weight quantization (default: 8)
+        a_weight_group_size: Group size for ALinear weight quantization (default: 128)
+        
         # Legacy quantization parameters (for backward compatibility)
         latent_quant_bits: Bits for latent quantization when not using KIVI
     """
@@ -46,6 +50,9 @@ class ALRDLlamaConfig(LlamaConfig):
         use_mixed_precision_value: bool = False,
         value_target_ratios: dict = None,
         default_value_target_ratio: float = 0.25,
+        # ALinear weight quantization
+        a_weight_bits: int = 8,
+        a_weight_group_size: int = 128,
         # Legacy parameters
         latent_quant_bits: int = 3,
         latent_quant_sym: bool = True,
@@ -66,6 +73,10 @@ class ALRDLlamaConfig(LlamaConfig):
         self.use_mixed_precision_value = use_mixed_precision_value
         self.value_target_ratios = value_target_ratios or {}
         self.default_value_target_ratio = default_value_target_ratio
+        
+        # ALinear weight quantization
+        self.a_weight_bits = a_weight_bits
+        self.a_weight_group_size = a_weight_group_size
         
         # Legacy parameters
         self.latent_quant_bits = latent_quant_bits
