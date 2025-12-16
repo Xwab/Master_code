@@ -50,6 +50,10 @@ def get_args():
                         help="Model dtype")
     parser.add_argument("--baseline", action="store_true",
                         help="Also test baseline (no quantization)")
+    parser.add_argument("--use_cache", action="store_true",
+                        help="Use KV cache (prefill + decode mode)")
+    parser.add_argument("--prefill_length", type=int, default=256,
+                        help="Prefill length when using cache")
     return parser.parse_args()
 
 
@@ -79,8 +83,8 @@ def load_dataset(dataset_name, tokenizer):
 
 
 @torch.no_grad()
-def eval_ppl(model, testenc, seqlen, limit, device):
-    """评估 PPL"""
+def eval_ppl(model, testenc, seqlen, limit, device, use_kivi_cache=False):
+    """评估 PPL (不使用 cache，直接 forward)"""
     model.eval()
     
     testenc = testenc.input_ids
@@ -97,7 +101,9 @@ def eval_ppl(model, testenc, seqlen, limit, device):
     for i in tqdm(range(nsamples), desc="Evaluating"):
         batch = testenc[:, (i * seqlen): ((i + 1) * seqlen)].to(device)
         
-        outputs = model(batch, use_cache=True)
+        # 不使用 cache，直接一次 forward 整个序列
+        # KIVI 在 attention 内部会对 K/V 进行量化
+        outputs = model(batch, use_cache=False)
         logits = outputs.logits
         
         shift_logits = logits[:, :-1, :].contiguous()
@@ -111,6 +117,109 @@ def eval_ppl(model, testenc, seqlen, limit, device):
         nlls.append(loss.float() * (seqlen - 1))
     
     ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * (seqlen - 1)))
+    return ppl.item()
+
+
+@torch.no_grad()
+def eval_ppl_with_cache(model, testenc, seqlen, limit, device, 
+                         prefill_length=256, group_size=128):
+    """
+    评估 PPL (使用 KV cache，触发 KIVI 量化)
+    
+    流程:
+    1. Prefill: 一次性处理前 prefill_length 个 token
+    2. Decode: 逐 token 处理剩余的 token
+    """
+    model.eval()
+    
+    testenc = testenc.input_ids
+    nsamples = testenc.numel() // seqlen
+    
+    if limit is not None:
+        nsamples = min(nsamples, limit)
+    
+    # 确保 prefill_length 对齐到 group_size
+    prefill_length = ((prefill_length + group_size - 1) // group_size) * group_size
+    
+    print(f"Evaluating {nsamples} samples, seqlen={seqlen}, prefill_length={prefill_length}")
+    
+    total_loss = 0.0
+    total_tokens = 0
+    
+    for i in tqdm(range(nsamples), desc="Evaluating"):
+        batch = testenc[:, (i * seqlen): ((i + 1) * seqlen)].to(device)
+        seq_len = batch.size(1)
+        
+        if seq_len <= prefill_length:
+            # 序列太短，直接 forward
+            outputs = model(batch, use_cache=False)
+            logits = outputs.logits
+            shift_logits = logits[:, :-1, :]
+            shift_labels = batch[:, 1:]
+            loss = nn.functional.cross_entropy(
+                shift_logits.reshape(-1, shift_logits.size(-1)),
+                shift_labels.reshape(-1),
+                reduction='sum'
+            )
+            total_loss += loss.item()
+            total_tokens += shift_labels.numel()
+            continue
+        
+        past_key_values = None
+        
+        # ============================================================
+        # 阶段 1: Prefill
+        # ============================================================
+        prefill_tokens = batch[:, :prefill_length]
+        outputs = model(
+            prefill_tokens,
+            past_key_values=None,
+            use_cache=True,
+        )
+        past_key_values = outputs.past_key_values
+        logits = outputs.logits
+        
+        # Prefill 部分的 loss
+        shift_logits = logits[:, :-1, :]
+        shift_labels = prefill_tokens[:, 1:]
+        loss = nn.functional.cross_entropy(
+            shift_logits.reshape(-1, shift_logits.size(-1)),
+            shift_labels.reshape(-1),
+            reduction='sum'
+        )
+        total_loss += loss.item()
+        total_tokens += shift_labels.numel()
+        
+        # ============================================================
+        # 阶段 2: Decode (逐 token)
+        # ============================================================
+        for j in range(prefill_length, seq_len):
+            curr_token = batch[:, j:j+1]
+            target_token = batch[:, j:j+1] if j < seq_len - 1 else None
+            
+            outputs = model(
+                curr_token,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            past_key_values = outputs.past_key_values
+            
+            # 计算 loss (预测下一个 token)
+            if j < seq_len - 1:
+                logits = outputs.logits[:, -1, :]
+                target = batch[:, j + 1]
+                loss = nn.functional.cross_entropy(logits, target, reduction='sum')
+                total_loss += loss.item()
+                total_tokens += target.numel()
+        
+        # 调试信息 (第一个 sample)
+        if i == 0:
+            print(f"\n[DEBUG] Sample 0 cache info:")
+            print(f"  Cache type: {type(past_key_values)}")
+            if hasattr(past_key_values, 'get_seq_length'):
+                print(f"  Cache seq_length: {past_key_values.get_seq_length()}")
+    
+    ppl = torch.exp(torch.tensor(total_loss / total_tokens))
     return ppl.item()
 
 
@@ -164,7 +273,14 @@ def main():
             trust_remote_code=True,
         )
         
-        ppl_baseline = eval_ppl(baseline_model, testenc, args.seqlen, args.limit, args.device)
+        if args.use_cache:
+            ppl_baseline = eval_ppl_with_cache(
+                baseline_model, testenc, args.seqlen, args.limit, args.device,
+                prefill_length=args.prefill_length, group_size=args.group_size
+            )
+        else:
+            ppl_baseline = eval_ppl(baseline_model, testenc, args.seqlen, args.limit, args.device)
+        
         results["baseline"] = ppl_baseline
         print(f"\nBaseline PPL: {ppl_baseline:.4f}")
         
@@ -214,7 +330,16 @@ def main():
     print(f"  group_size: {getattr(kivi_model.config, 'group_size', 'N/A')}")
     print(f"  residual_length: {getattr(kivi_model.config, 'residual_length', 'N/A')}")
     
-    ppl_kivi = eval_ppl(kivi_model, testenc, args.seqlen, args.limit, args.device)
+    if args.use_cache:
+        print(f"\nUsing KV cache mode (prefill_length={args.prefill_length})")
+        ppl_kivi = eval_ppl_with_cache(
+            kivi_model, testenc, args.seqlen, args.limit, args.device,
+            prefill_length=args.prefill_length, group_size=args.group_size
+        )
+    else:
+        print(f"\nUsing direct forward mode (no cache)")
+        ppl_kivi = eval_ppl(kivi_model, testenc, args.seqlen, args.limit, args.device)
+    
     results["kivi"] = ppl_kivi
     print(f"\nKIVI PPL: {ppl_kivi:.4f}")
     
