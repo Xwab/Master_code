@@ -1529,11 +1529,20 @@ class ALRDLlamaForCausalLM(LlamaForCausalLM):
         
         This makes the model compatible with lm_eval and other evaluation frameworks
         that call model.generate() without explicitly passing a KIVI cache.
+        
+        To use KIVI cache, the past_key_values must be an instance of KIVILatentCache.
+        This is checked in attention via: use_kivi_cache = isinstance(past_key_value, KIVILatentCache)
         """
-        # Check if KIVI should be used and no cache is provided
-        if self.use_kivi and kwargs.get('past_key_values') is None:
-            # Create KIVI cache automatically
-            kwargs['past_key_values'] = self.create_kivi_cache()
+        past_key_values = kwargs.get('past_key_values')
+        
+        # Check if we should use KIVI cache
+        # 1. use_kivi is enabled in config
+        # 2. No cache provided, OR cache is not KIVILatentCache
+        if self.use_kivi:
+            if past_key_values is None or not isinstance(past_key_values, KIVILatentCache):
+                # Create KIVI cache automatically
+                kwargs['past_key_values'] = self.create_kivi_cache()
+                print(f"[KIVI] Auto-created KIVILatentCache for generate()")
             
             # Ensure use_cache is True
             if 'use_cache' not in kwargs:
@@ -1571,10 +1580,17 @@ class ALRDLlamaForCausalLM(LlamaForCausalLM):
     ):
         """
         Override forward to automatically use KIVI cache when use_kivi is enabled.
+        
+        To use KIVI cache, the past_key_values must be an instance of KIVILatentCache.
+        This is checked in attention via: use_kivi_cache = isinstance(past_key_value, KIVILatentCache)
         """
-        # Check if KIVI should be used and no cache is provided
-        if self.use_kivi and past_key_values is None and use_cache:
-            past_key_values = self.create_kivi_cache()
+        # Determine if we should use cache
+        use_cache_flag = use_cache if use_cache is not None else self.config.use_cache
+        
+        # Check if we should use KIVI cache
+        if self.use_kivi and use_cache_flag:
+            if past_key_values is None or not isinstance(past_key_values, KIVILatentCache):
+                past_key_values = self.create_kivi_cache()
         
         return super().forward(
             input_ids=input_ids,
