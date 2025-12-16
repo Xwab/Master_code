@@ -37,8 +37,7 @@ def get_args():
     parser.add_argument("--residual_length", type=int, default=128,
                         help="Number of recent tokens to keep in full precision")
     parser.add_argument("--dataset", type=str, default="wikitext2",
-                        choices=["wikitext2", "c4", "ptb"],
-                        help="Dataset for PPL evaluation")
+                        help="Dataset for PPL evaluation (comma-separated for multiple: wikitext2,c4,ptb)")
     parser.add_argument("--seqlen", type=int, default=2048,
                         help="Sequence length")
     parser.add_argument("--limit", type=int, default=None,
@@ -57,28 +56,36 @@ def get_args():
     return parser.parse_args()
 
 
-def load_dataset(dataset_name, tokenizer):
-    """加载数据集"""
+def load_testdata(dataset_name, tokenizer):
+    """加载数据集并 tokenize"""
     from datasets import load_dataset as hf_load_dataset
     
     print(f"Loading dataset: {dataset_name}")
     
+    # 检查 tokenizer 类型
+    if not callable(tokenizer):
+        raise TypeError(f"tokenizer must be callable, got {type(tokenizer)}")
+    
     if dataset_name == "wikitext2":
         testdata = hf_load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
-        testenc = tokenizer("\n\n".join(testdata['text']), return_tensors='pt')
+        text = "\n\n".join(testdata['text'])
+        testenc = tokenizer(text, return_tensors='pt')
     elif dataset_name == "c4":
         testdata = hf_load_dataset(
             'allenai/c4', 'allenai--c4',
             data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'},
             split='validation'
         )
-        testenc = tokenizer(' '.join(testdata[:1100]['text']), return_tensors='pt')
+        text = ' '.join(testdata[:1100]['text'])
+        testenc = tokenizer(text, return_tensors='pt')
     elif dataset_name == "ptb":
         testdata = hf_load_dataset('ptb_text_only', 'penn_treebank', split='test')
-        testenc = tokenizer(" ".join(testdata['sentence']), return_tensors='pt')
+        text = " ".join(testdata['sentence'])
+        testenc = tokenizer(text, return_tensors='pt')
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
     
+    print(f"Dataset {dataset_name}: {testenc.input_ids.numel()} tokens")
     return testenc
 
 
@@ -140,7 +147,7 @@ def eval_ppl_with_cache(
             testloader = torch.load(cache_testloader)
         else:
             print(f"Creating testloader for {dataset}...")
-            testloader = load_dataset(dataset, tokenizer)
+            testloader = load_testdata(dataset, tokenizer)
             torch.save(testloader, cache_testloader)
             print(f"Saved to {cache_testloader}")
         
@@ -268,7 +275,7 @@ def eval_ppl_simple(
             testloader = torch.load(cache_testloader)
         else:
             print(f"Creating testloader for {dataset}...")
-            testloader = load_dataset(dataset, tokenizer)
+            testloader = load_testdata(dataset, tokenizer)
             torch.save(testloader, cache_testloader)
             print(f"Saved to {cache_testloader}")
         
