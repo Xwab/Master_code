@@ -6,12 +6,15 @@ that stores low-rank KV latents with KIVI-style quantization:
 - Key: per-channel quantization (along token dimension)
 - Value: per-token quantization (along hidden dimension)
 - Recent tokens kept in full precision (residual)
+
+Compatible with model.generate()!
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, List, Any, Dict
+from transformers.cache_utils import Cache
 import math
 
 
@@ -88,7 +91,7 @@ class KIVIQuantizer(nn.Module):
         return x_dequant
 
 
-class KIVILatentCache:
+class KIVILatentCache(Cache):
     """
     KIVI-style cache for low-rank KV latents.
     
@@ -97,7 +100,19 @@ class KIVILatentCache:
     - Quantized cache for older tokens (memory efficient)
     - Full-precision cache for recent tokens (accuracy)
     
-    Compatible with the transformers Cache interface.
+    Compatible with transformers Cache interface and model.generate()!
+    
+    Usage:
+        # Create cache
+        kivi_cache = KIVILatentCache(k_bits=2, v_bits=2)
+        
+        # Use with generate
+        outputs = model.generate(
+            input_ids,
+            past_key_values=kivi_cache,
+            use_cache=True,
+            max_new_tokens=100,
+        )
     """
     
     def __init__(
@@ -105,8 +120,9 @@ class KIVILatentCache:
         k_bits: int = 2,
         v_bits: int = 2, 
         group_size: int = 128,
-        residual_length: int = 32,
+        residual_length: int = 128,
     ):
+        super().__init__()
         self.k_bits = k_bits
         self.v_bits = v_bits
         self.group_size = group_size
@@ -116,9 +132,40 @@ class KIVILatentCache:
         # Format: {layer_idx: (key_quant, key_residual, value_quant, value_residual)}
         self._cache: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         
+        # Track seen tokens
+        self._seen_tokens = 0
+        
         # Quantizers
         self.key_quantizer = KIVIQuantizer(n_bits=k_bits, group_size=group_size, per_channel=True)
         self.value_quantizer = KIVIQuantizer(n_bits=v_bits, group_size=group_size, per_channel=False)
+    
+    def __len__(self) -> int:
+        """Return number of layers cached."""
+        return len(self._cache)
+    
+    def __iter__(self):
+        """Iterate over layers."""
+        for layer_idx in sorted(self._cache.keys()):
+            yield self[layer_idx]
+    
+    def __getitem__(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get cached key/value for a layer."""
+        if layer_idx not in self._cache:
+            raise KeyError(f"Layer {layer_idx} not in cache")
+        
+        key_quant, key_residual, value_quant, value_residual = self._cache[layer_idx]
+        
+        if key_quant is not None and key_residual is not None:
+            all_keys = torch.cat([key_quant, key_residual], dim=1)
+            all_values = torch.cat([value_quant, value_residual], dim=1)
+        elif key_residual is not None:
+            all_keys = key_residual
+            all_values = value_residual
+        else:
+            all_keys = key_quant
+            all_values = value_quant
+        
+        return all_keys, all_values
     
     def get_seq_length(self, layer_idx: int = 0) -> int:
         """Get current sequence length in cache."""
@@ -134,33 +181,65 @@ class KIVILatentCache:
         """Get the usable length considering new tokens."""
         return self.get_seq_length(layer_idx)
     
+    def get_max_length(self) -> Optional[int]:
+        """Get max length (None for dynamic cache)."""
+        return None
+    
+    @property
+    def seen_tokens(self) -> int:
+        """Return total number of seen tokens."""
+        if not self._cache:
+            return 0
+        return self.get_seq_length(0)
+    
     @torch.no_grad()
     def update(
         self,
-        key_latent: torch.Tensor,
-        value_latent: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
         layer_idx: int,
+        cache_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Update cache with new key/value latents.
+        Update cache with new key/value states.
+        
+        This method is compatible with both:
+        1. Standard transformers cache interface (4D tensors: [batch, heads, seq, head_dim])
+        2. Low-rank latent mode (3D tensors: [batch, seq, rank])
         
         Args:
-            key_latent: [batch, seq_len, rank] - output of k_proj.BLinear
-            value_latent: [batch, seq_len, rank] - output of v_proj.BLinear
+            key_states: Key states or latents
+            value_states: Value states or latents
             layer_idx: Current layer index
+            cache_kwargs: Additional kwargs (unused, for compatibility)
             
         Returns:
-            all_keys: Concatenated key latents (quantized + residual)
-            all_values: Concatenated value latents (quantized + residual)
+            Updated key and value states
         """
-        batch_size, new_seq_len, rank = key_latent.shape
+        # Detect input format
+        if key_states.dim() == 4:
+            # Standard format: [batch, heads, seq, head_dim]
+            # Reshape to [batch, seq, heads * head_dim] for quantization
+            batch, heads, seq_len, head_dim = key_states.shape
+            key_states_flat = key_states.transpose(1, 2).reshape(batch, seq_len, heads * head_dim)
+            value_states_flat = value_states.transpose(1, 2).reshape(batch, seq_len, heads * head_dim)
+            is_4d = True
+        else:
+            # Latent format: [batch, seq, rank]
+            key_states_flat = key_states
+            value_states_flat = value_states
+            is_4d = False
+        
+        batch_size, new_seq_len, dim = key_states_flat.shape
         
         if layer_idx not in self._cache:
             # First call: initialize cache
+            self._seen_tokens = new_seq_len
+            
             if new_seq_len <= self.residual_length:
                 # All tokens fit in residual (no quantization)
-                self._cache[layer_idx] = (None, key_latent, None, value_latent)
-                return key_latent, value_latent
+                self._cache[layer_idx] = (None, key_states_flat.clone(), None, value_states_flat.clone())
+                return key_states, value_states
             else:
                 # Need to quantize some tokens
                 n_quant = new_seq_len - self.residual_length
@@ -169,32 +248,35 @@ class KIVILatentCache:
                 
                 if n_quant > 0:
                     # Quantize older tokens
-                    key_to_quant = key_latent[:, :n_quant, :]
-                    key_residual = key_latent[:, n_quant:, :]
-                    value_to_quant = value_latent[:, :n_quant, :]
-                    value_residual = value_latent[:, n_quant:, :]
+                    key_to_quant = key_states_flat[:, :n_quant, :]
+                    key_residual = key_states_flat[:, n_quant:, :].clone()
+                    value_to_quant = value_states_flat[:, :n_quant, :]
+                    value_residual = value_states_flat[:, n_quant:, :].clone()
                     
                     key_quant = self.key_quantizer(key_to_quant)
                     value_quant = self.value_quantizer(value_to_quant)
                     
                     self._cache[layer_idx] = (key_quant, key_residual, value_quant, value_residual)
                     
-                    return torch.cat([key_quant, key_residual], dim=1), \
-                           torch.cat([value_quant, value_residual], dim=1)
+                    all_keys = torch.cat([key_quant, key_residual], dim=1)
+                    all_values = torch.cat([value_quant, value_residual], dim=1)
                 else:
-                    self._cache[layer_idx] = (None, key_latent, None, value_latent)
-                    return key_latent, value_latent
+                    self._cache[layer_idx] = (None, key_states_flat.clone(), None, value_states_flat.clone())
+                    all_keys = key_states_flat
+                    all_values = value_states_flat
         else:
             # Append to existing cache
             key_quant, key_residual, value_quant, value_residual = self._cache[layer_idx]
             
+            self._seen_tokens += new_seq_len
+            
             # Append new tokens to residual
             if key_residual is not None:
-                key_residual = torch.cat([key_residual, key_latent], dim=1)
-                value_residual = torch.cat([value_residual, value_latent], dim=1)
+                key_residual = torch.cat([key_residual, key_states_flat], dim=1)
+                value_residual = torch.cat([value_residual, value_states_flat], dim=1)
             else:
-                key_residual = key_latent
-                value_residual = value_latent
+                key_residual = key_states_flat.clone()
+                value_residual = value_states_flat.clone()
             
             # Check if we need to move tokens to quantized cache
             residual_len = key_residual.shape[1]
@@ -234,28 +316,27 @@ class KIVILatentCache:
             else:
                 all_keys = key_residual
                 all_values = value_residual
-            
-            return all_keys, all_values
-    
-    def __getitem__(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get cached key/value for a layer (for compatibility)."""
-        if layer_idx not in self._cache:
-            return None, None
         
-        key_quant, key_residual, value_quant, value_residual = self._cache[layer_idx]
-        
-        if key_quant is not None:
-            all_keys = torch.cat([key_quant, key_residual], dim=1)
-            all_values = torch.cat([value_quant, value_residual], dim=1)
-        else:
-            all_keys = key_residual
-            all_values = value_residual
+        # Convert back to 4D format if needed
+        if is_4d:
+            all_keys = all_keys.view(batch_size, -1, heads, head_dim).transpose(1, 2)
+            all_values = all_values.view(batch_size, -1, heads, head_dim).transpose(1, 2)
         
         return all_keys, all_values
     
-    def __len__(self) -> int:
-        """Return number of layers cached."""
-        return len(self._cache)
+    def reorder_cache(self, beam_idx: torch.LongTensor):
+        """Reorder cache for beam search."""
+        for layer_idx in self._cache:
+            key_quant, key_residual, value_quant, value_residual = self._cache[layer_idx]
+            
+            if key_quant is not None:
+                key_quant = key_quant.index_select(0, beam_idx)
+                value_quant = value_quant.index_select(0, beam_idx)
+            if key_residual is not None:
+                key_residual = key_residual.index_select(0, beam_idx)
+                value_residual = value_residual.index_select(0, beam_idx)
+            
+            self._cache[layer_idx] = (key_quant, key_residual, value_quant, value_residual)
     
     def to_legacy_cache(self) -> Tuple[Tuple[torch.Tensor, torch.Tensor], ...]:
         """Convert to legacy cache format for compatibility."""
@@ -265,22 +346,56 @@ class KIVILatentCache:
             legacy.append((keys, values))
         return tuple(legacy)
     
+    @classmethod
+    def from_legacy_cache(
+        cls, 
+        past_key_values: Tuple[Tuple[torch.Tensor, torch.Tensor], ...],
+        k_bits: int = 2,
+        v_bits: int = 2,
+        group_size: int = 128,
+        residual_length: int = 128,
+    ) -> "KIVILatentCache":
+        """Create KIVILatentCache from legacy cache format."""
+        cache = cls(k_bits=k_bits, v_bits=v_bits, group_size=group_size, residual_length=residual_length)
+        
+        for layer_idx, (key_states, value_states) in enumerate(past_key_values):
+            cache.update(key_states, value_states, layer_idx)
+        
+        return cache
+    
     def reset(self):
         """Clear all cached data."""
         self._cache.clear()
+        self._seen_tokens = 0
     
-    def seen_tokens(self) -> int:
-        """Return total number of seen tokens."""
+    def get_cache_info(self) -> Dict[str, Any]:
+        """Get cache statistics for debugging."""
         if not self._cache:
-            return 0
-        return self.get_seq_length(0)
+            return {"status": "empty"}
+        
+        layer_0 = self._cache.get(0)
+        if layer_0 is None:
+            return {"status": "no layer 0"}
+        
+        key_quant, key_residual, value_quant, value_residual = layer_0
+        
+        return {
+            "num_layers": len(self._cache),
+            "total_seq_len": self.get_seq_length(0),
+            "quantized_len": key_quant.shape[1] if key_quant is not None else 0,
+            "residual_len": key_residual.shape[1] if key_residual is not None else 0,
+            "k_bits": self.k_bits,
+            "v_bits": self.v_bits,
+            "group_size": self.group_size,
+            "residual_length": self.residual_length,
+        }
 
 
 def create_kivi_cache(
     k_bits: int = 2,
     v_bits: int = 2,
     group_size: int = 128,
-    residual_length: int = 32,
+    residual_length: int = 128,
 ) -> KIVILatentCache:
     """
     Factory function to create a KIVI cache.
@@ -293,6 +408,15 @@ def create_kivi_cache(
         
     Returns:
         KIVILatentCache instance
+        
+    Example:
+        kivi_cache = create_kivi_cache(k_bits=2, v_bits=2)
+        outputs = model.generate(
+            input_ids,
+            past_key_values=kivi_cache,
+            use_cache=True,
+            max_new_tokens=100,
+        )
     """
     return KIVILatentCache(
         k_bits=k_bits,
@@ -305,6 +429,7 @@ def create_kivi_cache(
 # Legacy exports for compatibility
 KIVICache = KIVILatentCache
 KIVIDynamicCache = KIVILatentCache
+
 
 def create_kivi_quantizers(
     k_bits: int = 2,
