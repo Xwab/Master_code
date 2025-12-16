@@ -974,8 +974,8 @@ class ALRDLinear_KIVI_Key(nn.Module):
             per_channel=True,  # Key uses per-channel quantization
         )
         
-        # Keep legacy quantizer for compatibility
-        self.quantizer = Quantizer(n_bits=k_bits, group_size=0, sym=False, clip_ratio=1.0)
+        # KIVI-style quantizer (per-channel for Key)
+        self.quantizer = KIVIKeyQuantizer(n_bits=k_bits, group_size=group_size)
     
     def quantize_latent(self, latents: torch.Tensor) -> torch.Tensor:
         """Simple quantization without residual."""
@@ -1027,8 +1027,8 @@ class ALRDLinear_KIVI_Value(nn.Module):
             per_channel=False,  # Value uses per-token quantization
         )
         
-        # Keep legacy quantizer for compatibility
-        self.quantizer = Quantizer(n_bits=v_bits, group_size=0, sym=False, clip_ratio=1.0)
+        # KIVI-style quantizer (per-token for Value)
+        self.quantizer = KIVIValueQuantizer(n_bits=v_bits, group_size=group_size)
     
     def quantize_latent(self, latents: torch.Tensor) -> torch.Tensor:
         """Simple quantization without residual."""
@@ -1118,9 +1118,9 @@ class ALRDLinear_KIVI_Value_Mixed(nn.Module):
             self.n_4bit = (self.n_4bit // group_size) * group_size
             self.n_2bit = out_features - self.n_4bit
         
-        # Create quantizers for each precision level
-        self.quantizer_4bit = Quantizer(n_bits=4, group_size=group_size, sym=False, clip_ratio=1.0)
-        self.quantizer_2bit = Quantizer(n_bits=2, group_size=group_size, sym=False, clip_ratio=1.0)
+        # Create KIVI-style quantizers for each precision level (per-token for Value)
+        self.quantizer_4bit = KIVIValueQuantizer(n_bits=4, group_size=group_size)
+        self.quantizer_2bit = KIVIValueQuantizer(n_bits=2, group_size=group_size)
         
         # Store actual average bits for logging
         self.avg_bits = (4 * self.n_4bit + 2 * self.n_2bit) / out_features if out_features > 0 else 0
