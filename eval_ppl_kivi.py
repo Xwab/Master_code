@@ -71,6 +71,19 @@ def eval_ppl_kivi(
     group_size = getattr(model.config, 'group_size', 128)
     residual_length = getattr(model.config, 'residual_length', 128)
     
+    # chunk_size 必须:
+    # 1. > residual_length 才能触发量化
+    # 2. 是 group_size 的整数倍（KIVI triton kernel 要求）
+    if chunk_size <= residual_length:
+        chunk_size = residual_length + group_size
+        if verbose:
+            print(f"[INFO] Adjusted chunk_size to {chunk_size} (> residual_length)")
+    
+    if chunk_size % group_size != 0:
+        chunk_size = ((chunk_size // group_size) + 1) * group_size
+        if verbose:
+            print(f"[INFO] Aligned chunk_size to group_size: {chunk_size}")
+    
     if verbose:
         print("=" * 60)
         print("KIVI PPL Evaluation")
@@ -82,11 +95,6 @@ def eval_ppl_kivi(
         print(f"chunk_size: {chunk_size}")
         print(f"seqlen: {seqlen}")
         print("=" * 60)
-        
-        if chunk_size <= residual_length:
-            print(f"[WARNING] chunk_size({chunk_size}) <= residual_length({residual_length})")
-            print(f"          KIVI quantization may NOT trigger!")
-            print("=" * 60)
 
     results = {}
 
@@ -131,11 +139,19 @@ def eval_ppl_kivi(
             
             # ============================================================
             # 分块 forward - 触发 KIVI 量化
+            # 注意：每个 chunk 必须是 group_size 的整数倍
             # ============================================================
-            for start in range(0, seq_len, chunk_size):
-                end = min(start + chunk_size, seq_len)
+            
+            # 计算可以完整分块的长度
+            n_full_chunks = seq_len // chunk_size
+            aligned_len = n_full_chunks * chunk_size
+            remainder = seq_len - aligned_len
+            
+            # 处理完整的 chunks
+            for start in range(0, aligned_len, chunk_size):
+                end = start + chunk_size
                 chunk = batch[:, start:end]
-                chunk_len = end - start
+                chunk_len = chunk_size
                 
                 # Forward with KV cache
                 outputs = model(
@@ -147,22 +163,20 @@ def eval_ppl_kivi(
                 logits = outputs.logits  # [batch, chunk_len, vocab_size]
                 
                 # 计算 loss: 预测 chunk 内的下一个 token
-                # logits[:, :-1] 预测 labels[:, 1:]
-                if chunk_len > 1:
-                    shift_logits = logits[:, :-1, :].contiguous()
-                    shift_labels = chunk[:, 1:].contiguous()
-                    
-                    loss = loss_fct(
-                        shift_logits.view(-1, shift_logits.size(-1)),
-                        shift_labels.view(-1)
-                    )
-                    sample_loss += loss.item()
-                    sample_tokens += shift_labels.numel()
+                shift_logits = logits[:, :-1, :].contiguous()
+                shift_labels = chunk[:, 1:].contiguous()
                 
-                # 还需要计算 chunk 最后一个 token 预测下一个 chunk 第一个 token
+                loss = loss_fct(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1)
+                )
+                sample_loss += loss.item()
+                sample_tokens += shift_labels.numel()
+                
+                # chunk 最后一个 token 预测下一个 token
                 if end < seq_len:
-                    next_token_logits = logits[:, -1:, :]  # [batch, 1, vocab_size]
-                    next_token_label = batch[:, end:end+1]  # [batch, 1]
+                    next_token_logits = logits[:, -1:, :]
+                    next_token_label = batch[:, end:end+1]
                     
                     loss = loss_fct(
                         next_token_logits.view(-1, next_token_logits.size(-1)),
@@ -170,6 +184,25 @@ def eval_ppl_kivi(
                     )
                     sample_loss += loss.item()
                     sample_tokens += next_token_label.numel()
+            
+            # 处理剩余的 tokens（逐 token 处理，避免不对齐问题）
+            if remainder > 0:
+                for j in range(aligned_len, seq_len - 1):
+                    curr_token = batch[:, j:j+1]
+                    
+                    outputs = model(
+                        curr_token,
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                    )
+                    past_key_values = outputs.past_key_values
+                    
+                    logits = outputs.logits[:, -1, :]
+                    target = batch[:, j + 1]
+                    
+                    loss = F.cross_entropy(logits, target, reduction='sum')
+                    sample_loss += loss.item()
+                    sample_tokens += target.numel()
             
             nlls.append(sample_loss)
             total_tokens += sample_tokens
@@ -252,15 +285,21 @@ def eval_ppl_kivi_token_by_token(
     residual_length = getattr(model.config, 'residual_length', 128)
     group_size = getattr(model.config, 'group_size', 128)
     
-    # 设置 prefill 长度：必须 > residual_length 才能触发量化
+    # 设置 prefill 长度：
+    # 1. 必须 > residual_length 才能触发量化
+    # 2. 必须是 group_size 的整数倍（KIVI 的 triton kernel 要求）
     if prefill_length is None:
         # 默认: residual_length + group_size，确保能触发量化
         prefill_length = residual_length + group_size
     
     if prefill_length <= residual_length:
         print(f"[WARNING] prefill_length({prefill_length}) <= residual_length({residual_length})")
-        print(f"          Setting prefill_length = residual_length + group_size = {residual_length + group_size}")
         prefill_length = residual_length + group_size
+    
+    # 对齐到 group_size 的整数倍
+    if prefill_length % group_size != 0:
+        prefill_length = ((prefill_length // group_size) + 1) * group_size
+        print(f"[INFO] Aligned prefill_length to group_size: {prefill_length}")
     
     if verbose:
         print("=" * 60)
