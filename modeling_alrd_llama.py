@@ -13,7 +13,11 @@ from transformers.modeling_outputs import (
 )
 from typing import List, Optional, Tuple, Union
 from transformers.cache_utils import DynamicCache, StaticCache
-from modules.quant_utils import Quantizer, Quantizer2, quantize_tensor_forward
+from modules.quant_utils import (
+    Quantizer, Quantizer2, quantize_tensor_forward,
+    KIVIKeyQuantizer, KIVIValueQuantizer, KIVIMixedQuantizer,
+    kivi_quantize_per_channel, kivi_quantize_per_token
+)
 from modules.hadamard_utils import apply_hadamard
 logger = logging.get_logger(__name__)
 
@@ -915,6 +919,116 @@ class ALRDLinear_quant(nn.Module):
        #return self.ALinear(self.BLinear(input))
 
 
+# ============================================================================
+# KIVI-style Low-Rank Linear Layers
+# ============================================================================
+
+class ALRDLinear_KIVI_Key(nn.Module):
+    """
+    Low-rank linear layer with KIVI-style per-channel quantization for Key.
+    
+    Key cache is quantized per-channel (along the token dimension), which 
+    preserves the variance structure that is important for attention computation.
+    """
+    
+    def __init__(
+        self, 
+        in_features: int, 
+        out_features: int, 
+        rank: int, 
+        bias: bool = True,
+        k_bits: int = 2,
+        group_size: int = 128,
+        residual_length: int = 32,
+    ):
+        super().__init__()
+        self.BLinear = nn.Linear(in_features, rank, bias=False)
+        self.ALinear = nn.Linear(rank, out_features, bias=bias)
+        self.rank = rank
+        
+        # KIVI-style quantizer: per-channel for Key
+        self.kivi_quantizer = KIVIMixedQuantizer(
+            n_bits=k_bits,
+            group_size=group_size,
+            residual_length=residual_length,
+            per_channel=True,  # Key uses per-channel quantization
+        )
+        
+        # Keep legacy quantizer for compatibility
+        self.quantizer = Quantizer(n_bits=k_bits, group_size=0, sym=False, clip_ratio=1.0)
+    
+    def quantize_latent(self, latents: torch.Tensor) -> torch.Tensor:
+        """Simple quantization without residual."""
+        x_quant, _, _ = kivi_quantize_per_channel(
+            latents, 
+            self.kivi_quantizer.n_bits, 
+            self.kivi_quantizer.group_size
+        )
+        return x_quant
+    
+    def quantize_latent_mixed(self, latents: torch.Tensor) -> torch.Tensor:
+        """KIVI-style quantization with residual (recent tokens in full precision)."""
+        return self.kivi_quantizer(latents)
+    
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        y = self.BLinear(input)
+        y = self.quantize_latent(y)
+        return self.ALinear(y)
+
+
+class ALRDLinear_KIVI_Value(nn.Module):
+    """
+    Low-rank linear layer with KIVI-style per-token quantization for Value.
+    
+    Value cache is quantized per-token (along the hidden dimension), which
+    works better for the weighted sum operation in attention.
+    """
+    
+    def __init__(
+        self, 
+        in_features: int, 
+        out_features: int, 
+        rank: int, 
+        bias: bool = True,
+        v_bits: int = 2,
+        group_size: int = 128,
+        residual_length: int = 32,
+    ):
+        super().__init__()
+        self.BLinear = nn.Linear(in_features, rank, bias=False)
+        self.ALinear = nn.Linear(rank, out_features, bias=bias)
+        self.rank = rank
+        
+        # KIVI-style quantizer: per-token for Value
+        self.kivi_quantizer = KIVIMixedQuantizer(
+            n_bits=v_bits,
+            group_size=group_size,
+            residual_length=residual_length,
+            per_channel=False,  # Value uses per-token quantization
+        )
+        
+        # Keep legacy quantizer for compatibility
+        self.quantizer = Quantizer(n_bits=v_bits, group_size=0, sym=False, clip_ratio=1.0)
+    
+    def quantize_latent(self, latents: torch.Tensor) -> torch.Tensor:
+        """Simple quantization without residual."""
+        x_quant, _, _ = kivi_quantize_per_token(
+            latents, 
+            self.kivi_quantizer.n_bits, 
+            self.kivi_quantizer.group_size
+        )
+        return x_quant
+    
+    def quantize_latent_mixed(self, latents: torch.Tensor) -> torch.Tensor:
+        """KIVI-style quantization with residual (recent tokens in full precision)."""
+        return self.kivi_quantizer(latents)
+    
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        y = self.BLinear(input)
+        y = self.quantize_latent(y)
+        return self.ALinear(y)
+
+
 class ALRDLlamaForCausalLM(LlamaForCausalLM):
     
     config_class = ALRDLlamaConfig
@@ -923,6 +1037,13 @@ class ALRDLlamaForCausalLM(LlamaForCausalLM):
         super().__init__(config)
         self.truncation_ranks = config.truncation_ranks
         self.model = CustomLlamaModel(config)
+        
+        # KIVI parameters
+        self.use_kivi = getattr(config, 'use_kivi', False)
+        self.k_bits = getattr(config, 'k_bits', 2)
+        self.v_bits = getattr(config, 'v_bits', 2)
+        self.group_size = getattr(config, 'group_size', 128)
+        self.residual_length = getattr(config, 'residual_length', 32)
 
         full_name_dict = {module: name for name, module in self.named_modules()}
         linear_info = {}
@@ -941,14 +1062,53 @@ class ALRDLlamaForCausalLM(LlamaForCausalLM):
                     modules.append(raw_linear)
 
         for name, module in self.named_modules():
-            if name in self.truncation_ranks :
+            if name in self.truncation_ranks:
                 info = linear_info[module]
-                if name.endswith('k_proj'):
-                    new_layer = ALRDLinear_quant_key_v2(module.in_features, module.out_features, self.truncation_ranks[name],
-                                        bias=module.bias is not None)
-                elif name.endswith('v_proj'):
-                    new_layer = ALRDLinear_quant_key_v2(module.in_features, module.out_features, self.truncation_ranks[name],
-                                        bias=module.bias is not None)
+                rank = self.truncation_ranks[name]
+                
+                if self.use_kivi:
+                    # Use KIVI-style quantization
+                    if name.endswith('k_proj'):
+                        new_layer = ALRDLinear_KIVI_Key(
+                            module.in_features, 
+                            module.out_features, 
+                            rank,
+                            bias=module.bias is not None,
+                            k_bits=self.k_bits,
+                            group_size=self.group_size,
+                            residual_length=self.residual_length,
+                        )
+                    elif name.endswith('v_proj'):
+                        new_layer = ALRDLinear_KIVI_Value(
+                            module.in_features, 
+                            module.out_features, 
+                            rank,
+                            bias=module.bias is not None,
+                            v_bits=self.v_bits,
+                            group_size=self.group_size,
+                            residual_length=self.residual_length,
+                        )
+                    else:
+                        continue
+                else:
+                    # Use legacy quantization
+                    if name.endswith('k_proj'):
+                        new_layer = ALRDLinear_quant_key_v2(
+                            module.in_features, 
+                            module.out_features, 
+                            rank,
+                            bias=module.bias is not None
+                        )
+                    elif name.endswith('v_proj'):
+                        new_layer = ALRDLinear_quant_key_v2(
+                            module.in_features, 
+                            module.out_features, 
+                            rank,
+                            bias=module.bias is not None
+                        )
+                    else:
+                        continue
+                
                 setattr(info["father"], info["name"], new_layer)
 
 
