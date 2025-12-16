@@ -2,6 +2,41 @@
 
 本文档说明如何将 KIVI 的量化方法集成到低秩分解的 KV 缓存压缩方案中。
 
+## 快速开始
+
+```python
+from configuration_alrd_llama import ALRDLlamaConfig
+from modeling_alrd_llama import ALRDLlamaForCausalLM
+import torch
+
+# 1. 创建配置
+config = ALRDLlamaConfig.from_pretrained("meta-llama/Llama-2-7b-hf")
+config.truncation_ranks = {
+    "model.layers.0.self_attn.k_proj": 256,
+    "model.layers.0.self_attn.v_proj": 256,
+    # ... 其他层
+}
+config.use_kivi = True
+config.k_bits = 2
+config.v_bits = 2
+
+# 2. 加载模型
+model = ALRDLlamaForCausalLM.from_pretrained(
+    "meta-llama/Llama-2-7b-hf",
+    config=config,
+    torch_dtype=torch.float16,
+)
+
+# 3. 创建 KIVI 缓存并生成
+kivi_cache = model.create_kivi_cache()
+outputs = model.generate(
+    input_ids,
+    past_key_values=kivi_cache,
+    use_cache=True,
+    max_new_tokens=100,
+)
+```
+
 ## 架构概述
 
 ```
@@ -128,40 +163,96 @@ value_quantizer = KIVIMixedQuantizer(
 )
 ```
 
-### 5. 自定义 KIVI Cache
+### 5. 使用 KIVILatentCache
 
-如果需要更细粒度的控制，可以使用 `KIVIDynamicCache`:
+`KIVILatentCache` 是一个 drop-in replacement，可以直接替代 transformers 的 DynamicCache：
 
 ```python
-from modules.kivi_cache import KIVIDynamicCache, create_kivi_quantizers
+from modules.kivi_cache import KIVILatentCache, create_kivi_cache
 
-# 创建量化器
-key_quantizer, value_quantizer = create_kivi_quantizers(
-    k_bits=2,
-    v_bits=2,
-    group_size=128,
-    residual_length=32,
+# 方法1: 通过模型创建（推荐）
+model = ALRDLlamaForCausalLM.from_pretrained(...)
+kivi_cache = model.create_kivi_cache()
+
+# 方法2: 手动创建
+kivi_cache = create_kivi_cache(
+    k_bits=2,          # Key 量化位数
+    v_bits=2,          # Value 量化位数
+    group_size=128,    # 分组大小
+    residual_length=32 # 全精度残差长度
 )
 
-# 创建动态缓存
-cache = KIVIDynamicCache(
-    num_layers=32,
-    k_bits=2,
-    v_bits=2,
-    group_size=128,
-    residual_length=32,
+# 在 generate 中使用
+outputs = model.generate(
+    input_ids,
+    past_key_values=kivi_cache,  # 使用 KIVI cache
+    use_cache=True,
+    max_new_tokens=100,
 )
 
-# 在推理中使用
-for layer_idx in range(num_layers):
-    key_latent = k_proj.BLinear(hidden_states)
-    value_latent = v_proj.BLinear(hidden_states)
-    
-    # 更新缓存（自动处理量化和残差）
-    all_keys, all_values = cache.update(
-        key_latent, value_latent, layer_idx,
-        key_quantizer, value_quantizer
+# 手动推理循环
+for step in range(max_steps):
+    outputs = model(
+        input_ids=next_token_id,
+        past_key_values=kivi_cache,
+        use_cache=True,
     )
+    # kivi_cache 会自动更新
+    next_token_id = outputs.logits.argmax(-1)
+```
+
+### 6. KIVILatentCache 工作原理
+
+```
+Prefill 阶段 (处理 prompt):
+┌─────────────────────────────────────────────────────────────┐
+│  token1, token2, ..., token_n (n > residual_length)         │
+│                                                             │
+│  ┌─────────────────────────┐  ┌───────────────────────────┐ │
+│  │  量化缓存 (2bit)        │  │  残差缓存 (FP16)          │ │
+│  │  token1...token_{n-32}  │  │  token_{n-31}...token_n   │ │
+│  │  per-channel (Key)      │  │  保持全精度               │ │
+│  │  per-token (Value)      │  │                           │ │
+│  └─────────────────────────┘  └───────────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+
+Decode 阶段 (逐 token 生成):
+┌─────────────────────────────────────────────────────────────┐
+│  每生成一个新 token:                                        │
+│                                                             │
+│  1. 新 token 加入残差缓存                                   │
+│  2. 如果残差缓存超过 residual_length:                       │
+│     - 最旧的 tokens 量化后移入量化缓存                      │
+│     - 保持残差缓存大小 = residual_length                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 7. 自定义量化器
+
+如果需要更细粒度的控制：
+
+```python
+from modules.kivi_cache import KIVIQuantizer
+
+# 创建自定义量化器
+key_quantizer = KIVIQuantizer(
+    n_bits=2,
+    group_size=128,
+    per_channel=True,   # Key: per-channel
+)
+
+value_quantizer = KIVIQuantizer(
+    n_bits=2,
+    group_size=128,
+    per_channel=False,  # Value: per-token
+)
+
+# 手动量化
+key_latent = k_proj.BLinear(hidden_states)
+key_quantized = key_quantizer(key_latent)
+
+value_latent = v_proj.BLinear(hidden_states)
+value_quantized = value_quantizer(value_latent)
 ```
 
 ## 压缩率计算

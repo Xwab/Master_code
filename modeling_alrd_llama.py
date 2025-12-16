@@ -19,6 +19,7 @@ from modules.quant_utils import (
     kivi_quantize_per_channel, kivi_quantize_per_token
 )
 from modules.hadamard_utils import apply_hadamard
+from modules.kivi_cache import KIVILatentCache, create_kivi_cache
 logger = logging.get_logger(__name__)
 
 
@@ -64,34 +65,31 @@ class CustomLlamaSdpaAttention(LlamaSdpaAttention):
         bsz, q_len, _ = hidden_states.size()
         query_states = self.q_proj(hidden_states)
         
+        # Check if using KIVI cache (handles quantization internally)
+        use_kivi_cache = isinstance(past_key_value, KIVILatentCache)
 
-        key_states = self.k_proj.BLinear(hidden_states)#[:,:,:k_rank]
-        key_states = self.k_proj.quantize_latent_mixed(key_states)
-        #key_states = self.k_proj.quantize_latent(key_states) ##quant latent
-        #key_states = self.k_proj.quantize_latent_mixed(key_states) ##quant latent
-        value_states = self.v_proj.BLinear(hidden_states)#[:,:,:v_rank]
-        #value_states = self.v_proj.quantize_latent(value_states) ##quant latent
-        #value_states = self.v_proj.quantize_latent_mixed(value_states) ##quant latent
+        # Compute low-rank latent representations
+        key_latent = self.k_proj.BLinear(hidden_states)  # [bsz, q_len, rank]
+        value_latent = self.v_proj.BLinear(hidden_states)  # [bsz, q_len, rank]
         
-
-        #value_states_high, value_states_low, B_sacles_high, B_sacles_low = self.v_proj.quantize_latent_mixed(value_states)
-        value_states = self.v_proj.quantize_latent_mixed(value_states)
-       
+        if use_kivi_cache:
+            # KIVI cache handles quantization internally with per-channel/per-token scheme
+            # and maintains residual (recent tokens in full precision)
+            key_states, value_states = past_key_value.update(key_latent, value_latent, self.layer_idx)
+        else:
+            # Legacy path: use external quantization
+            key_states = self.k_proj.quantize_latent_mixed(key_latent)
+            value_states = self.v_proj.quantize_latent_mixed(value_latent)
+            
+            if past_key_value is not None:
+                # Update with standard DynamicCache
+                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx)
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            #key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx)
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx)
-        #A_weight_partial_k = self.k_proj.ALinear.weight.data[:,:k_rank]
-        #A_weight_partial_v = self.v_proj.ALinear.weight.data[:,:k_rank]
-        #key_states = torch.matmul(key_states, A_weight_partial_k.t())
-        #value_states = torch.matmul(value_states, A_weight_partial_v.t())
+        # Restore full dimension from low-rank latent
         key_states = self.k_proj.ALinear(key_states)
         quantized_value_A_Linear = self.quantizer(self.v_proj.ALinear.weight.data)
-        #quantized_value_A_Linear_high = quantized_value_A_Linear[:, :high_bit_rank_num]
-        #quantized_value_A_Linear_low = quantized_value_A_Linear[:, high_bit_rank_num:]
         value_states = torch.matmul(value_states, quantized_value_A_Linear.t())
 
         #value_states_high = value_states[:, :, :high_bit_rank_num]
@@ -198,21 +196,31 @@ class CustomLlamaFlashAttention2(LlamaFlashAttention2):
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj.BLinear(hidden_states)
-        key_states = self.k_proj.quantize_latent(key_states)
-        value_states = self.v_proj.BLinear(hidden_states)
-        value_states = self.v_proj.quantize_latent(value_states)
+        
+        # Check if using KIVI cache (handles quantization internally)
+        use_kivi_cache = isinstance(past_key_value, KIVILatentCache)
+        
+        # Compute low-rank latent representations
+        key_latent = self.k_proj.BLinear(hidden_states)  # [bsz, q_len, rank]
+        value_latent = self.v_proj.BLinear(hidden_states)  # [bsz, q_len, rank]
+        
+        if use_kivi_cache:
+            # KIVI cache handles quantization internally with per-channel/per-token scheme
+            key_states, value_states = past_key_value.update(key_latent, value_latent, self.layer_idx)
+        else:
+            # Legacy path: use external quantization
+            key_states = self.k_proj.quantize_latent(key_latent)
+            value_states = self.v_proj.quantize_latent(value_latent)
+            
+            if past_key_value is not None:
+                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx)
 
         # Flash attention requires the input to have the shape
         # batch_size x seq_length x head_dim x hidden_dim
         # therefore we just need to keep the original shape
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            #key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx)
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx)
-
+        # Restore full dimension from low-rank latent
         key_states = self.k_proj.ALinear(key_states)
         quantized_value_A_Linear = self.quantizer(self.v_proj.ALinear.weight.data)
         value_states = torch.matmul(value_states, quantized_value_A_Linear.t())
@@ -1110,7 +1118,28 @@ class ALRDLlamaForCausalLM(LlamaForCausalLM):
                         continue
                 
                 setattr(info["father"], info["name"], new_layer)
-
-
-
-
+    
+    def create_kivi_cache(self) -> KIVILatentCache:
+        """
+        Create a KIVI cache for this model.
+        
+        Usage:
+            model = ALRDLlamaForCausalLM.from_pretrained(...)
+            kivi_cache = model.create_kivi_cache()
+            
+            # Use in generation
+            outputs = model.generate(
+                input_ids,
+                past_key_values=kivi_cache,
+                use_cache=True,
+            )
+        
+        Returns:
+            KIVILatentCache configured with model's KIVI parameters
+        """
+        return create_kivi_cache(
+            k_bits=self.k_bits,
+            v_bits=self.v_bits,
+            group_size=self.group_size,
+            residual_length=self.residual_length,
+        )
