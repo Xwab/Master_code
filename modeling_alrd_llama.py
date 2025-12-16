@@ -1037,6 +1037,149 @@ class ALRDLinear_KIVI_Value(nn.Module):
         return self.ALinear(y)
 
 
+class ALRDLinear_KIVI_Value_Mixed(nn.Module):
+    """
+    Low-rank linear layer with mixed-precision KIVI quantization for Value.
+    
+    This class implements mixed 4bit/2bit quantization based on singular value importance:
+    - Features with larger singular values (more important) → 4bit
+    - Features with smaller singular values (less important) → 2bit
+    
+    The split is determined by the target compression ratio:
+    - target_ratio: user-specified target compression ratio (r1)
+    - lowrank_ratio: rank / out_features (r2) 
+    - final_ratio: r1 * r2 (should be >= 0.125 for 2bit minimum)
+    
+    Compression calculation:
+    - n_4bit = out_features * (8 * final_ratio - 1)
+    - n_2bit = out_features - n_4bit
+    - Average bits = (4 * n_4bit + 2 * n_2bit) / out_features
+    """
+    
+    def __init__(
+        self, 
+        in_features: int, 
+        out_features: int, 
+        rank: int, 
+        bias: bool = True,
+        target_ratio: float = 0.25,  # Target compression ratio (r1)
+        group_size: int = 128,
+        residual_length: int = 32,
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank = rank
+        self.group_size = group_size
+        self.residual_length = residual_length
+        
+        # BLinear outputs full out_features (not rank)
+        # This allows mixed-precision quantization on full feature space
+        self.BLinear = nn.Linear(in_features, out_features, bias=False)
+        self.ALinear = nn.Linear(out_features, out_features, bias=bias)
+        
+        # Calculate compression ratios
+        self.lowrank_ratio = rank / out_features  # r2
+        self.target_ratio = target_ratio  # r1
+        self.final_ratio = self.target_ratio * self.lowrank_ratio  # r = r1 * r2
+        
+        # Calculate 4bit/2bit split based on final compression ratio
+        # Compression: (4 * n_4bit + 2 * n_2bit) / (16 * out_features) = final_ratio
+        # Solving: n_4bit = out_features * (8 * final_ratio - 1)
+        #          n_2bit = out_features * (2 - 8 * final_ratio)
+        
+        if self.final_ratio <= 0.125:
+            # All 2bit (maximum compression)
+            self.n_4bit = 0
+            self.n_2bit = out_features
+        elif self.final_ratio >= 0.25:
+            # All 4bit (minimum compression for mixed mode)
+            self.n_4bit = out_features
+            self.n_2bit = 0
+        else:
+            # Mixed precision
+            self.n_4bit = int(out_features * (8 * self.final_ratio - 1))
+            self.n_2bit = out_features - self.n_4bit
+        
+        # Ensure alignment to group_size for efficient quantization
+        if group_size > 0:
+            self.n_4bit = (self.n_4bit // group_size) * group_size
+            self.n_2bit = out_features - self.n_4bit
+        
+        # Create quantizers for each precision level
+        self.quantizer_4bit = Quantizer(n_bits=4, group_size=group_size, sym=False, clip_ratio=1.0)
+        self.quantizer_2bit = Quantizer(n_bits=2, group_size=group_size, sym=False, clip_ratio=1.0)
+        
+        # Store actual average bits for logging
+        self.avg_bits = (4 * self.n_4bit + 2 * self.n_2bit) / out_features if out_features > 0 else 0
+        
+        print(f"ALRDLinear_KIVI_Value_Mixed: out_features={out_features}, "
+              f"n_4bit={self.n_4bit}, n_2bit={self.n_2bit}, "
+              f"avg_bits={self.avg_bits:.2f}, final_ratio={self.final_ratio:.4f}")
+    
+    def quantize_latent(self, latents: torch.Tensor) -> torch.Tensor:
+        """
+        Mixed-precision quantization: 4bit for important features, 2bit for others.
+        
+        Features are assumed to be ordered by singular value importance
+        (largest singular values first), so we apply 4bit to the first n_4bit
+        features and 2bit to the remaining.
+        
+        Args:
+            latents: [batch, seq_len, out_features]
+        
+        Returns:
+            Quantized latents with same shape
+        """
+        if self.n_4bit == self.out_features:
+            # All 4bit
+            return self.quantizer_4bit(latents)
+        elif self.n_4bit == 0:
+            # All 2bit
+            return self.quantizer_2bit(latents)
+        else:
+            # Mixed precision: split, quantize separately, concatenate
+            latents_4bit = latents[..., :self.n_4bit]
+            latents_2bit = latents[..., self.n_4bit:]
+            
+            quant_4bit = self.quantizer_4bit(latents_4bit)
+            quant_2bit = self.quantizer_2bit(latents_2bit)
+            
+            return torch.cat([quant_4bit, quant_2bit], dim=-1)
+    
+    def quantize_latent_mixed(self, latents: torch.Tensor) -> torch.Tensor:
+        """
+        Mixed-precision quantization with residual support.
+        Keep recent tokens in full precision.
+        """
+        seq_len = latents.shape[1]
+        
+        if seq_len <= self.residual_length:
+            # All tokens fit in residual, no quantization
+            return latents
+        
+        # Split into quantized and residual parts
+        n_quant = seq_len - self.residual_length
+        if self.group_size > 0:
+            n_quant = (n_quant // self.group_size) * self.group_size
+        
+        if n_quant <= 0:
+            return latents
+        
+        latents_to_quant = latents[:, :n_quant, :]
+        latents_residual = latents[:, n_quant:, :]
+        
+        # Apply mixed-precision quantization
+        latents_quantized = self.quantize_latent(latents_to_quant)
+        
+        return torch.cat([latents_quantized, latents_residual], dim=1)
+    
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        y = self.BLinear(input)
+        y = self.quantize_latent(y)
+        return self.ALinear(y)
+
+
 class ALRDLlamaForCausalLM(LlamaForCausalLM):
     
     config_class = ALRDLlamaConfig
@@ -1052,6 +1195,11 @@ class ALRDLlamaForCausalLM(LlamaForCausalLM):
         self.v_bits = getattr(config, 'v_bits', 2)
         self.group_size = getattr(config, 'group_size', 128)
         self.residual_length = getattr(config, 'residual_length', 32)
+        
+        # Mixed-precision Value parameters
+        self.use_mixed_precision_value = getattr(config, 'use_mixed_precision_value', False)
+        self.value_target_ratios = getattr(config, 'value_target_ratios', {})
+        self.default_value_target_ratio = getattr(config, 'default_value_target_ratio', 0.25)
 
         full_name_dict = {module: name for name, module in self.named_modules()}
         linear_info = {}
@@ -1087,15 +1235,31 @@ class ALRDLlamaForCausalLM(LlamaForCausalLM):
                             residual_length=self.residual_length,
                         )
                     elif name.endswith('v_proj'):
-                        new_layer = ALRDLinear_KIVI_Value(
-                            module.in_features, 
-                            module.out_features, 
-                            rank,
-                            bias=module.bias is not None,
-                            v_bits=self.v_bits,
-                            group_size=self.group_size,
-                            residual_length=self.residual_length,
-                        )
+                        if self.use_mixed_precision_value:
+                            # Use mixed 4bit/2bit quantization for Value
+                            target_ratio = self.value_target_ratios.get(
+                                name, self.default_value_target_ratio
+                            )
+                            new_layer = ALRDLinear_KIVI_Value_Mixed(
+                                module.in_features, 
+                                module.out_features, 
+                                rank,
+                                bias=module.bias is not None,
+                                target_ratio=target_ratio,
+                                group_size=self.group_size,
+                                residual_length=self.residual_length,
+                            )
+                        else:
+                            # Use uniform quantization for Value
+                            new_layer = ALRDLinear_KIVI_Value(
+                                module.in_features, 
+                                module.out_features, 
+                                rank,
+                                bias=module.bias is not None,
+                                v_bits=self.v_bits,
+                                group_size=self.group_size,
+                                residual_length=self.residual_length,
+                            )
                     else:
                         continue
                 else:

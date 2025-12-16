@@ -20,6 +20,13 @@ class ALRDLlamaConfig(LlamaConfig):
         residual_length: Number of recent tokens to keep in full precision (default: 32)
         use_kivi: Whether to use KIVI-style quantization (default: True)
         
+        # Mixed-precision Value quantization
+        use_mixed_precision_value: Whether to use mixed 4bit/2bit for Value (default: False)
+        value_target_ratios: Dict mapping layer names to target compression ratios
+            e.g., {"model.layers.0.self_attn.v_proj": 0.2, ...}
+            If not specified, uses default_value_target_ratio
+        default_value_target_ratio: Default target compression ratio for Value (default: 0.25)
+        
         # Legacy quantization parameters (for backward compatibility)
         latent_quant_bits: Bits for latent quantization when not using KIVI
     """
@@ -35,6 +42,10 @@ class ALRDLlamaConfig(LlamaConfig):
         group_size: int = 128,
         residual_length: int = 32,
         use_kivi: bool = True,
+        # Mixed-precision Value quantization
+        use_mixed_precision_value: bool = False,
+        value_target_ratios: dict = None,
+        default_value_target_ratio: float = 0.25,
         # Legacy parameters
         latent_quant_bits: int = 3,
         latent_quant_sym: bool = True,
@@ -50,6 +61,11 @@ class ALRDLlamaConfig(LlamaConfig):
         self.group_size = group_size
         self.residual_length = residual_length
         self.use_kivi = use_kivi
+        
+        # Mixed-precision Value parameters
+        self.use_mixed_precision_value = use_mixed_precision_value
+        self.value_target_ratios = value_target_ratios or {}
+        self.default_value_target_ratio = default_value_target_ratio
         
         # Legacy parameters
         self.latent_quant_bits = latent_quant_bits
