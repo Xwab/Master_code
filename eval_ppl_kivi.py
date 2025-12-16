@@ -233,11 +233,16 @@ def eval_ppl_kivi_token_by_token(
     device: str = "cuda",
     limit: int = 50,
     verbose: bool = True,
+    prefill_length: int = None,  # 首次 prefill 的长度，默认使用 residual_length
 ):
     """
     逐 token 的 KIVI PPL 测试（最准确但最慢）
     
-    这个版本完全模拟自回归生成，每次只 forward 一个 token。
+    工作流程：
+    1. Prefill: 首先处理 prefill_length 个 token（必须 >= residual_length）
+    2. Decode: 然后逐 token 处理剩余的 token
+    
+    这样符合 KIVI 的预期：decode 时 value_full_length == residual_length + 1
     """
     model = model.to(device)
     if isinstance(device, str):
@@ -245,12 +250,26 @@ def eval_ppl_kivi_token_by_token(
 
     # 获取 KIVI 参数
     residual_length = getattr(model.config, 'residual_length', 128)
+    group_size = getattr(model.config, 'group_size', 128)
+    
+    # 设置 prefill 长度：必须 > residual_length 才能触发量化
+    if prefill_length is None:
+        # 默认: residual_length + group_size，确保能触发量化
+        prefill_length = residual_length + group_size
+    
+    if prefill_length <= residual_length:
+        print(f"[WARNING] prefill_length({prefill_length}) <= residual_length({residual_length})")
+        print(f"          Setting prefill_length = residual_length + group_size = {residual_length + group_size}")
+        prefill_length = residual_length + group_size
     
     if verbose:
         print("=" * 60)
-        print("KIVI PPL Evaluation (Token-by-Token)")
+        print("KIVI PPL Evaluation (Prefill + Token-by-Token Decode)")
+        print("=" * 60)
         print(f"residual_length: {residual_length}")
-        print(f"This mode is SLOW but accurately simulates autoregressive generation")
+        print(f"group_size: {group_size}")
+        print(f"prefill_length: {prefill_length}")
+        print(f"seqlen: {seqlen}")
         print("=" * 60)
 
     results = {}
@@ -275,15 +294,62 @@ def eval_ppl_kivi_token_by_token(
 
         total_loss = 0.0
         total_tokens = 0
+        loss_fct = nn.CrossEntropyLoss(reduction='sum')
 
         for i in tqdm(range(min(nsamples, limit)), desc=f"Eval {dataset}"):
             batch = testenc[:, (i * seqlen) : ((i + 1) * seqlen)].to(device)
             seq_len = batch.size(1)
             
+            if seq_len <= prefill_length:
+                # 序列太短，直接一次 forward
+                outputs = model(batch, use_cache=False)
+                logits = outputs.logits
+                shift_logits = logits[:, :-1, :].contiguous()
+                shift_labels = batch[:, 1:].contiguous()
+                loss = loss_fct(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1)
+                )
+                total_loss += loss.item()
+                total_tokens += shift_labels.numel()
+                continue
+            
             past_key_values = None
             
-            # 逐 token forward
-            for j in range(seq_len - 1):
+            # ============================================================
+            # 阶段 1: Prefill - 一次性处理前 prefill_length 个 token
+            # ============================================================
+            prefill_tokens = batch[:, :prefill_length]
+            outputs = model(
+                prefill_tokens,
+                past_key_values=None,
+                use_cache=True,
+            )
+            past_key_values = outputs.past_key_values
+            
+            # 计算 prefill 阶段的 loss
+            prefill_logits = outputs.logits  # [batch, prefill_length, vocab_size]
+            shift_logits = prefill_logits[:, :-1, :].contiguous()
+            shift_labels = prefill_tokens[:, 1:].contiguous()
+            loss = loss_fct(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1)
+            )
+            total_loss += loss.item()
+            total_tokens += shift_labels.numel()
+            
+            # prefill 最后一个 token 预测下一个 token
+            last_logits = prefill_logits[:, -1, :]
+            next_target = batch[:, prefill_length]
+            loss = loss_fct(last_logits.unsqueeze(1).view(-1, last_logits.size(-1)), 
+                           next_target.view(-1))
+            total_loss += loss.item()
+            total_tokens += next_target.numel()
+            
+            # ============================================================
+            # 阶段 2: Decode - 逐 token 处理剩余的 token
+            # ============================================================
+            for j in range(prefill_length, seq_len - 1):
                 # 当前 token
                 curr_token = batch[:, j:j+1]
                 
@@ -305,19 +371,39 @@ def eval_ppl_kivi_token_by_token(
             # 调试信息
             if i == 0 and verbose:
                 print(f"\n[DEBUG] After sample 0:")
-                if hasattr(past_key_values, '_cache') and 0 in past_key_values._cache:
-                    k_q, k_r, v_q, v_r = past_key_values._cache[0]
-                    k_q_len = k_q.shape[1] if k_q is not None else 0
-                    k_r_len = k_r.shape[1] if k_r is not None else 0
-                    print(f"  Quantized tokens: {k_q_len}")
-                    print(f"  Residual tokens: {k_r_len}")
-                    print(f"  Total: {k_q_len + k_r_len}")
+                print(f"  Cache type: {type(past_key_values)}")
+                
+                # 检查 KIVI cache 状态
+                if hasattr(past_key_values, 'key_cache') and len(past_key_values.key_cache) > 0:
+                    # KIVI 原版 cache 结构
+                    print(f"  KIVI cache detected")
+                    if hasattr(past_key_values, 'key_cache_quant'):
+                        k_quant = past_key_values.key_cache_quant
+                        k_full = past_key_values.key_cache_full
+                        if k_quant is not None and len(k_quant) > 0 and k_quant[0] is not None:
+                            print(f"  Layer 0 quantized key shape: {k_quant[0].shape}")
+                        if k_full is not None and len(k_full) > 0 and k_full[0] is not None:
+                            print(f"  Layer 0 full key shape: {k_full[0].shape}")
+                
+                elif hasattr(past_key_values, '_cache'):
+                    # 自定义 KIVILatentCache 结构
+                    if 0 in past_key_values._cache:
+                        k_q, k_r, v_q, v_r = past_key_values._cache[0]
+                        k_q_len = k_q.shape[1] if k_q is not None else 0
+                        k_r_len = k_r.shape[1] if k_r is not None else 0
+                        print(f"  Quantized tokens: {k_q_len}")
+                        print(f"  Residual tokens: {k_r_len}")
+                        print(f"  Total: {k_q_len + k_r_len}")
+                
+                elif isinstance(past_key_values, tuple) and len(past_key_values) > 0:
+                    print(f"  Tuple cache, layer 0 key shape: {past_key_values[0][0].shape}")
 
         ppl = torch.exp(torch.tensor(total_loss / total_tokens))
         results[dataset] = ppl.item()
         
         if verbose:
             print(f"\n{dataset} PPL: {ppl.item():.4f}")
+            print(f"Total tokens evaluated: {total_tokens}")
 
     return results
 
