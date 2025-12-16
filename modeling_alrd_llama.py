@@ -1509,3 +1509,84 @@ class ALRDLlamaForCausalLM(LlamaForCausalLM):
             group_size=self.group_size,
             residual_length=self.residual_length,
         )
+    
+    def generate(
+        self,
+        inputs=None,
+        generation_config=None,
+        logits_processor=None,
+        stopping_criteria=None,
+        prefix_allowed_tokens_fn=None,
+        synced_gpus=None,
+        assistant_model=None,
+        streamer=None,
+        negative_prompt_ids=None,
+        negative_prompt_attention_mask=None,
+        **kwargs,
+    ):
+        """
+        Override generate to automatically use KIVI cache when use_kivi is enabled.
+        
+        This makes the model compatible with lm_eval and other evaluation frameworks
+        that call model.generate() without explicitly passing a KIVI cache.
+        """
+        # Check if KIVI should be used and no cache is provided
+        if self.use_kivi and kwargs.get('past_key_values') is None:
+            # Create KIVI cache automatically
+            kwargs['past_key_values'] = self.create_kivi_cache()
+            
+            # Ensure use_cache is True
+            if 'use_cache' not in kwargs:
+                kwargs['use_cache'] = True
+        
+        # Call parent's generate
+        return super().generate(
+            inputs=inputs,
+            generation_config=generation_config,
+            logits_processor=logits_processor,
+            stopping_criteria=stopping_criteria,
+            prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
+            synced_gpus=synced_gpus,
+            assistant_model=assistant_model,
+            streamer=streamer,
+            negative_prompt_ids=negative_prompt_ids,
+            negative_prompt_attention_mask=negative_prompt_attention_mask,
+            **kwargs,
+        )
+    
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        labels=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        cache_position=None,
+        **kwargs,
+    ):
+        """
+        Override forward to automatically use KIVI cache when use_kivi is enabled.
+        """
+        # Check if KIVI should be used and no cache is provided
+        if self.use_kivi and past_key_values is None and use_cache:
+            past_key_values = self.create_kivi_cache()
+        
+        return super().forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            labels=labels,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_position=cache_position,
+            **kwargs,
+        )
