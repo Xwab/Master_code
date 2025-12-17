@@ -1,49 +1,44 @@
 """
-KVQuant-style Simulated Quantization for LLaMA3 with PPL Evaluation
+KVQuant SimQuant PPL Evaluation Script
 
-This script EXACTLY replicates KVQuant's simulated quantization approach:
-1. Pre-RoPE quantization: Quantize K/V BEFORE applying RoPE
-2. K uses per-channel quantization (qchannel=0)
-3. V uses per-token quantization (qchannel=-1)
-4. Support dense-and-sparse quantization (outlier preservation)
+This script EXACTLY replicates KVQuant's llama_simquant.py workflow:
+1. Calibration phase: Collect activation statistics and compute quantization parameters
+2. Evaluation phase: Apply simulated quantization using calibrated parameters
 
-Two modes:
-- --pre_rope: True pre-RoPE quantization (quantize K before RoPE, RoPE applied after)
-- Default: Quantize k_proj/v_proj output (matches KVQuant simquant behavior)
+Key differences from simple dynamic quantization:
+- Uses calibration data to compute static outlier thresholds
+- Uses K-means clustering for NUQ lookup tables
+- Supports Q-Norm for improved accuracy
+- Key uses static (calibrated) quantization, Value uses dynamic quantization
 
-Reference: https://github.com/SqueezeAILab/KVQuant
+Reference: https://github.com/SqueezeAILab/KVQuant/blob/main/quant/llama_simquant.py
 """
 
+import argparse
+import logging
+import math
+import pickle
 import torch
 import torch.nn as nn
-from datasets import load_dataset
 from tqdm import tqdm
-import argparse
-import os
+import numpy as np
+
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
-from transformers.models.llama.modeling_llama import (
-    LlamaAttention, LlamaFlashAttention2, LlamaSdpaAttention,
-    apply_rotary_pos_emb, repeat_kv
-)
-from loguru import logger
-import math
-from typing import Optional, Tuple
+from datasets import load_dataset
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# Quantization Functions - EXACT copy from KVQuant
+# Quantization Functions (from KVQuant simquant_module_quantizer.py)
 # ============================================================================
 
 def round_to_nearest_pole_sim(w, poles):
     """
-    Round the numbers in w to the nearest value in poles (for NUQ).
-    
-    Args:
-        w: activation values (flattened tensor)
-        poles: tensor of quantization levels (centroids from K-means)
-    
-    Returns:
-        Tensor with each value replaced by nearest pole
+    Round values to nearest pole (centroid).
+    EXACT copy from KVQuant.
     """
     stack = []
     for c in poles:
@@ -51,174 +46,52 @@ def round_to_nearest_pole_sim(w, poles):
         stack.append(diff)
     diff = torch.stack(stack)
     idx = diff.argmin(axis=0)
-    
     aug = torch.zeros_like(w)
     for i, c in enumerate(poles):
         aug += (idx == i) * c
-    
     return aug
 
 
-def compute_nuq_lut_kmeans(activations, bits, qchannel=-1, include_sparse=False, 
-                           outlier_mask=None, num_samples=50000):
+def get_outliers(w, channel=-1, outlier_threshold_upper=-1, outlier_threshold_lower=-1,
+                 cap_outliers=-1, first_few_fp16=-1):
     """
-    Compute NUQ lookup table using K-means clustering.
-    This is the core of KVQuant's non-uniform quantization.
-    
-    Args:
-        activations: collected activation values
-        bits: number of quantization bits
-        qchannel: quantization channel
-        include_sparse: whether using sparse quantization
-        outlier_mask: mask for outliers to exclude
-        num_samples: max samples for K-means
-    
-    Returns:
-        LUT (lookup table) with 2^bits centroids
+    Detect outliers using STATIC thresholds (from calibration).
+    EXACT copy from KVQuant.
     """
-    try:
-        from sklearn.cluster import KMeans
-    except ImportError:
-        logger.warning("sklearn not installed, falling back to uniform quantization")
-        return None
+    outlier_threshold_upper = outlier_threshold_upper.unsqueeze(channel)
+    outlier_threshold_lower = outlier_threshold_lower.unsqueeze(channel)
     
-    # Normalize to [-1, 1]
-    if include_sparse and outlier_mask is not None:
-        clean_acts = activations[~outlier_mask]
-    else:
-        clean_acts = activations.flatten()
+    under_lower = w < outlier_threshold_lower
+    above_upper = w > outlier_threshold_upper
+    outlier_mask = torch.logical_or(under_lower, above_upper)
     
-    # Compute range for normalization
-    maxval = clean_acts.max()
-    minval = clean_acts.min()
-    rangeval = (maxval - minval) / 2
-    offset = (maxval + minval) / 2
+    if cap_outliers > -1:
+        zero_point = (outlier_threshold_upper + outlier_threshold_lower) / 2
+        distance = (outlier_threshold_upper - outlier_threshold_lower) / 2
+        outliers = w * outlier_mask
+        
+        values = torch.zeros_like(outliers)
+        values[outlier_mask] = ((w - zero_point) / distance)[outlier_mask]
+        
+        upper_values, upper_indices = torch.topk(values, 21, dim=-1)
+        lower_values, lower_indices = torch.topk(values, 21, dim=-1, largest=False)
+        indices_combined = torch.cat((upper_indices, lower_indices), dim=-1)
+        values_combined = torch.cat((upper_values, lower_values), dim=-1)
+        
+        values2 = torch.zeros_like(outliers)
+        values2.scatter_(-1, indices_combined, values_combined)
+        outlier_mask = values2 != 0
     
-    # Normalize
-    normalized = ((clean_acts - offset) / rangeval).cpu().numpy()
+    if first_few_fp16 > -1:
+        outlier_mask[:first_few_fp16, :] = True
     
-    # Subsample for efficiency
-    if len(normalized) > num_samples:
-        import numpy as np
-        indices = np.random.choice(len(normalized), num_samples, replace=False)
-        normalized = normalized[indices]
-    
-    normalized = normalized.reshape(-1, 1)
-    
-    # K-means clustering
-    n_clusters = 2 ** bits
-    kmeans = KMeans(
-        n_clusters=n_clusters,
-        random_state=0,
-        n_init="auto",
-        max_iter=50
-    ).fit(normalized)
-    
-    # Get centroids (sorted)
-    centroids = torch.tensor(kmeans.cluster_centers_.flatten()).sort().values
-    
-    return centroids
+    return outlier_mask
 
 
-def quant_fn_nuq(
-    inp,
-    bits=8,
-    qchannel=-1,
-    dynamicquantization=True,
-    include_sparse=False,
-    outlier_mask=None,
-    lut=None,
-    first_few_fp16=-1,
-    recent_fp16=-1
-):
+def get_outliers_dynamic(w, channel=-1, thresh=0.999, first_few_fp16=-1):
     """
-    Non-Uniform Quantization (NUQ) using lookup table.
-    
-    This is KVQuant's quant_fn_nuq_recon implementation:
-    1. Normalize input to [-1, 1]
-    2. Map each value to nearest LUT entry
-    3. De-normalize back to original range
-    
-    Args:
-        inp: input tensor
-        bits: quantization bits
-        qchannel: quantization channel (0=per-channel, -1=per-token)
-        dynamicquantization: compute range dynamically
-        include_sparse: use sparse quantization
-        outlier_mask: outlier positions
-        lut: lookup table (centroids)
-        first_few_fp16: keep first N tokens in FP16 (attention sink)
-        recent_fp16: keep last N tokens in FP16 (KIVI-style)
-    """
-    if lut is None:
-        # Fall back to uniform quantization if no LUT
-        return quant_fn_zp(inp, bits, qchannel, dynamicquantization, 
-                          include_sparse, outlier_mask)
-    
-    orig_inp = inp.clone() if (first_few_fp16 > -1 or recent_fp16 > -1) else None
-    
-    # Compute range dynamically
-    if dynamicquantization:
-        if include_sparse and outlier_mask is not None:
-            outliers = inp * outlier_mask
-            median = torch.median(inp, dim=qchannel).values.unsqueeze(qchannel)
-            median_mask = median * outlier_mask
-            tmp_inp = inp - outliers + median_mask
-            maxval = torch.max(tmp_inp, dim=qchannel).values
-            minval = torch.min(tmp_inp, dim=qchannel).values
-        else:
-            maxval = torch.max(inp, dim=qchannel).values
-            minval = torch.min(inp, dim=qchannel).values
-    
-    # Compute offset and range
-    offset = (maxval + minval) / 2
-    rangeval = (maxval - minval) / 2
-    offset = offset.unsqueeze(qchannel)
-    rangeval = rangeval.unsqueeze(qchannel)
-    
-    # Subtract offset to center around 0
-    inp = inp - offset
-    
-    # Handle outliers
-    if include_sparse and outlier_mask is not None:
-        outliers = inp * outlier_mask
-        inp = inp - outliers
-    
-    # Normalize to [-1, 1]
-    inp_scaled = inp / rangeval.clamp(min=1e-8)
-    
-    # Round to nearest LUT entry
-    lut_device = lut.to(inp_scaled.device).float()
-    Q = round_to_nearest_pole_sim(inp_scaled.flatten(), lut_device)
-    qinp_out = Q.reshape(inp.shape).to(inp_scaled.dtype)
-    
-    # De-normalize
-    qinp_out = qinp_out * rangeval
-    
-    # Add outliers back
-    if include_sparse and outlier_mask is not None:
-        qinp_out[outlier_mask] = 0
-        qinp_out = qinp_out + outliers
-    
-    # Shift by offset
-    qinp_out = qinp_out + offset
-    
-    # Keep first few tokens in FP16 (attention sink)
-    if first_few_fp16 > -1 and orig_inp is not None:
-        qinp_out[:first_few_fp16, :] = orig_inp[:first_few_fp16, :]
-    
-    # Keep last few tokens in FP16 (KIVI-style sliding window)
-    if recent_fp16 > -1 and orig_inp is not None and qinp_out.shape[0] > recent_fp16:
-        qinp_out[-recent_fp16:, :] = orig_inp[-recent_fp16:, :]
-    
-    return torch.nan_to_num(qinp_out, nan=0.0, posinf=0.0, neginf=0.0)
-
-
-def get_outliers_dynamic(w, channel=-1, thresh=0.999, first_few_fp16=-1, recent_fp16=-1):
-    """
-    Dynamically detect outliers (from KVQuant simquant_module_quantizer.py)
-    
-    Extended to support recent_fp16 for KIVI-style sliding window.
+    Dynamically detect outliers using quantile.
+    EXACT copy from KVQuant.
     """
     t = 1 - ((1 - thresh) / 2)
     w = w.float()
@@ -231,79 +104,20 @@ def get_outliers_dynamic(w, channel=-1, thresh=0.999, first_few_fp16=-1, recent_
     
     under_lower = w <= outlier_threshold_lower
     above_upper = w >= outlier_threshold_upper
-    
     outlier_mask = torch.logical_or(under_lower, above_upper)
     
-    # Attention sink: keep first few tokens in FP16
     if first_few_fp16 > -1:
         outlier_mask[:first_few_fp16, :] = True
-    
-    # KIVI-style: keep last few (recent) tokens in FP16
-    if recent_fp16 > -1 and w.shape[0] > recent_fp16:
-        outlier_mask[-recent_fp16:, :] = True
     
     return outlier_mask
 
 
-def quant_fn_1bit(inp, qchannel=-1, include_sparse=False, outlier_mask=None):
+def quant_fn_zp(inp, bits=8, qchannel=-1, dynamicquantization=False,
+                include_sparse=False, outlier_mask=None, maxval=-1, minval=-1, clamp=False):
     """
-    1-bit quantization (binarization) using mean as threshold.
-    
-    This is a simple sign-based binarization:
-    - Values >= mean -> max
-    - Values < mean -> min
-    
-    Note: 1-bit quantization has very poor quality for KV cache!
+    Integer quantization with zero-point.
+    EXACT copy from KVQuant.
     """
-    if include_sparse and outlier_mask is not None:
-        outliers = inp * outlier_mask
-        inp_clean = inp - outliers
-    else:
-        inp_clean = inp
-        outliers = None
-    
-    # Compute threshold (mean along quantization channel)
-    threshold = torch.mean(inp_clean, dim=qchannel, keepdim=True)
-    
-    # Compute min/max for reconstruction
-    maxval = torch.max(inp_clean, dim=qchannel, keepdim=True).values
-    minval = torch.min(inp_clean, dim=qchannel, keepdim=True).values
-    
-    # Binarize: >= threshold -> maxval, < threshold -> minval
-    qinp_out = torch.where(inp_clean >= threshold, maxval, minval)
-    
-    # Add outliers back
-    if include_sparse and outliers is not None:
-        qinp_out[outlier_mask] = 0
-        qinp_out = qinp_out + outliers
-    
-    return torch.nan_to_num(qinp_out, nan=0.0, posinf=0.0, neginf=0.0)
-
-
-def quant_fn_zp(
-    inp,
-    bits=8,
-    qchannel=-1,
-    dynamicquantization=True,
-    include_sparse=False,
-    outlier_mask=None,
-    maxval=None,
-    minval=None,
-    clamp=False,
-    first_few_fp16=-1,
-    recent_fp16=-1
-):
-    """
-    Integer quantization with zero-point (EXACT copy from KVQuant)
-    Extended to support 1-bit quantization and recent_fp16 (KIVI-style).
-    """
-    # Save original for first_few_fp16 and recent_fp16
-    orig_inp = inp.clone() if (first_few_fp16 > -1 or recent_fp16 > -1) else None
-    
-    # Special handling for 1-bit
-    if bits == 1:
-        return quant_fn_1bit(inp, qchannel, include_sparse, outlier_mask)
-    
     if dynamicquantization:
         if include_sparse and outlier_mask is not None:
             outliers = inp * outlier_mask
@@ -341,520 +155,777 @@ def quant_fn_zp(
         qinp_out[outlier_mask] = 0
         qinp_out = qinp_out + outliers
     
-    # Keep first few tokens in FP16 (attention sink)
-    if first_few_fp16 > -1 and orig_inp is not None:
-        qinp_out[:first_few_fp16, :] = orig_inp[:first_few_fp16, :]
-    
-    # Keep last few tokens in FP16 (KIVI-style sliding window)
-    if recent_fp16 > -1 and orig_inp is not None and qinp_out.shape[0] > recent_fp16:
-        qinp_out[-recent_fp16:, :] = orig_inp[-recent_fp16:, :]
-    
     qinp_out = torch.nan_to_num(qinp_out, nan=0.0, posinf=0.0, neginf=0.0)
     return qinp_out
 
 
-def simulated_quantize(
-    tensor,
-    bits,
-    qchannel,
-    include_sparse=False,
-    sparsity_threshold=0.999,
-    first_few_fp16=-1,
-    recent_fp16=-1,
-    clamp=False
-):
+def quant_fn_nuq_recon(inp, bits=8, qchannel=-1, dynamicquantization=False,
+                       include_sparse=False, outlier_mask=None, maxval=-1, minval=-1,
+                       lut=None, norm=False, normscale=None, normoffset=None,
+                       first_few_fp16=-1):
     """
-    Apply simulated quantization to a tensor.
-    
-    Args:
-        tensor: Input tensor [batch, seq, dim] or [batch, heads, seq, head_dim]
-        bits: Quantization bits
-        qchannel: Quantization channel (0=per-channel, -1=per-token)
-        include_sparse: Use dense-and-sparse quantization
-        sparsity_threshold: Outlier threshold
-        first_few_fp16: Keep first N tokens in FP16 (attention sink)
-        recent_fp16: Keep last N tokens in FP16 (KIVI-style sliding window)
+    Non-Uniform Quantization using lookup table.
+    EXACT copy from KVQuant.
     """
-    if bits >= 16:
-        return tensor
+    if first_few_fp16 > -1:
+        orig = inp.clone()
     
-    orig_shape = tensor.shape
-    orig_dtype = tensor.dtype
+    if dynamicquantization:
+        if include_sparse and outlier_mask is not None:
+            outliers = inp * outlier_mask
+            median = torch.median(inp, dim=qchannel).values
+            median = median.unsqueeze(qchannel)
+            median_mask = median * outlier_mask
+            tmp_inp = inp - outliers + median_mask
+            maxval = torch.max(tmp_inp, dim=qchannel).values
+            minval = torch.min(tmp_inp, dim=qchannel).values
+        else:
+            maxval = torch.max(inp, dim=qchannel).values
+            minval = torch.min(inp, dim=qchannel).values
     
-    # Reshape to 2D for quantization
-    tensor = tensor.reshape(-1, tensor.shape[-1]).float()
+    # Compute offset and range
+    offset = (maxval + minval) / 2
+    rangeval = (maxval - minval) / 2
+    offset = offset.unsqueeze(qchannel)
+    rangeval = rangeval.unsqueeze(qchannel)
     
-    # Detect outliers
-    if include_sparse:
-        outlier_mask = get_outliers_dynamic(
-            tensor, channel=qchannel, thresh=sparsity_threshold,
-            first_few_fp16=first_few_fp16, recent_fp16=recent_fp16
-        )
-    else:
-        outlier_mask = None
+    # Shift by offset
+    inp = inp - offset
     
-    # Quantize
-    tensor = quant_fn_zp(
-        tensor, bits=bits, qchannel=qchannel,
-        include_sparse=include_sparse, outlier_mask=outlier_mask,
-        dynamicquantization=True, clamp=clamp,
-        first_few_fp16=first_few_fp16, recent_fp16=recent_fp16
-    )
+    # Handle outliers
+    if include_sparse and outlier_mask is not None:
+        outliers = inp * outlier_mask
+        inp = inp - outliers
     
-    return tensor.reshape(orig_shape).to(orig_dtype)
+    # Normalize to [-1, 1]
+    inp_scaled = inp / rangeval.clamp(min=1e-8)
+    
+    # Round to nearest LUT entry
+    lut_cuda = torch.tensor(lut[0]).to(inp_scaled.device).float()
+    Q = round_to_nearest_pole_sim(inp_scaled.flatten(), lut_cuda)
+    qinp_out = Q.reshape(inp.shape).float().to(inp_scaled.device)
+    
+    # Q-Norm
+    if norm and normscale is not None and normoffset is not None:
+        normscale = normscale.to(inp_scaled.device)
+        normoffset = normoffset.to(inp_scaled.device)
+        qinp_out = qinp_out * normscale + normoffset
+    
+    # De-normalize
+    qinp_out = qinp_out * rangeval
+    
+    # Add outliers back
+    if include_sparse and outlier_mask is not None:
+        qinp_out[outlier_mask] = 0
+        qinp_out = qinp_out + outliers
+    
+    # Shift by offset
+    qinp_out = qinp_out + offset
+    qinp_out = torch.nan_to_num(qinp_out, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    # Keep first few in FP16
+    if first_few_fp16 > -1:
+        qinp_out[:first_few_fp16, :] = orig[:first_few_fp16, :]
+    
+    return qinp_out.float()
 
 
 # ============================================================================
-# QuantLinearSim - For k_proj/v_proj replacement (simquant mode)
+# SimQuant Calibration Class (from KVQuant)
+# ============================================================================
+
+class SimQuant:
+    """
+    Calibration class for collecting activation statistics and computing
+    quantization parameters. EXACT copy from KVQuant.
+    """
+    
+    def __init__(self, layer, bits, perchannel=True, qchannel=0):
+        self.layer = layer
+        self.dev = self.layer.weight.device
+        W = layer.weight.data.clone()
+        self.perchannel = perchannel
+        self.qchannel = qchannel
+        self.bits = bits
+        
+        self.rows = W.shape[0]
+        self.columns = W.shape[1]
+        self.nsamples = 0
+        self.out = None
+    
+    def add_batch(self, inp, out):
+        """Collect output activations."""
+        if len(out.shape) == 2:
+            out = out.unsqueeze(0)
+        tmp = out.shape[0]
+        if isinstance(self.layer, nn.Linear):
+            if len(out.shape) == 3:
+                out = out.reshape((-1, self.rows))
+        self.nsamples += tmp
+        
+        if self.out is None:
+            self.out = out.clone()
+        else:
+            self.out = torch.cat((self.out, out.clone()), dim=0)
+    
+    def quantize(self, include_sparse=False, sparsity_threshold=0.999,
+                 nuq=False, fisher=None, norm=False, cap_outliers=False,
+                 first_few_fp16=-1, seqlen=2048):
+        """
+        Compute quantization parameters from collected activations.
+        Returns: (outlier_threshold_upper, outlier_threshold_lower, centroids, [normscale, normoffset])
+        """
+        if include_sparse:
+            t = 1 - ((1 - sparsity_threshold) / 2)
+        else:
+            t = 1  # Use min-max quantization
+        
+        data = self.out.float().cpu().numpy()
+        
+        # Handle cap_outliers for per-channel quantization
+        if self.perchannel and cap_outliers:
+            data = torch.tensor(data)
+            outlier_threshold_upper = torch.tensor(
+                np.percentile(data.numpy(), t * 100, axis=self.qchannel)
+            ).unsqueeze(self.qchannel)
+            outlier_threshold_lower = torch.tensor(
+                np.percentile(data.numpy(), (1 - t) * 100, axis=self.qchannel)
+            ).unsqueeze(self.qchannel)
+            
+            zero_point = (outlier_threshold_upper + outlier_threshold_lower) / 2
+            distance = (outlier_threshold_upper - outlier_threshold_lower) / 2
+            data2 = ((data - zero_point) / distance.clamp(min=1e-8)).abs()
+            
+            outlier_mask = torch.zeros_like(data2, dtype=torch.bool)
+            hidden_dim = data.shape[-1]
+            num_elems = max(1, math.ceil((1 - t) * hidden_dim))
+            upper_indices = torch.topk(data2, min(num_elems, data2.shape[-1])).indices
+            
+            true_mask = torch.ones_like(upper_indices, dtype=torch.bool)
+            outlier_mask.scatter_(-1, upper_indices, true_mask)
+            
+            if first_few_fp16 > -1:
+                for i in range(self.nsamples):
+                    start = i * seqlen
+                    end = i * seqlen + first_few_fp16
+                    if end <= outlier_mask.shape[0]:
+                        outlier_mask[start:end, :] = True
+            
+            med = torch.median(data, dim=0).values.unsqueeze(0).expand_as(data)
+            data_trimmed = data.clone()
+            data_trimmed[outlier_mask] = med[outlier_mask]
+            
+            outlier_threshold_upper = torch.max(data_trimmed, dim=self.qchannel).values
+            outlier_threshold_lower = torch.min(data_trimmed, dim=self.qchannel).values
+            data = data.numpy()
+        
+        # Compute thresholds
+        if self.perchannel:
+            outlier_threshold_upper = np.percentile(data, t * 100, axis=self.qchannel)
+            outlier_threshold_lower = np.percentile(data, (1 - t) * 100, axis=self.qchannel)
+        else:
+            # Per-token not currently supported in calibration
+            outlier_threshold_upper = np.percentile(data, t * 100, axis=self.qchannel)
+            outlier_threshold_lower = np.percentile(data, (1 - t) * 100, axis=self.qchannel)
+        
+        # Convert to torch
+        data = torch.tensor(data)
+        outlier_threshold_upper = torch.tensor(outlier_threshold_upper).unsqueeze(self.qchannel)
+        outlier_threshold_lower = torch.tensor(outlier_threshold_lower).unsqueeze(self.qchannel)
+        
+        # Range and offset
+        rangeval = (outlier_threshold_upper - outlier_threshold_lower) / 2
+        zeropoint = (outlier_threshold_upper + outlier_threshold_lower) / 2
+        
+        # Normalize
+        data_shifted = data - zeropoint
+        data_shifted_normalized = data_shifted / rangeval.clamp(min=1e-8)
+        
+        # Get outlier mask
+        outlier_mask = torch.logical_or(
+            data_shifted_normalized > 1,
+            data_shifted_normalized < -1
+        )
+        
+        # Remove first few tokens from K-means fitting
+        if first_few_fp16 > -1:
+            for i in range(self.nsamples):
+                start = i * seqlen
+                end = i * seqlen + first_few_fp16
+                if end <= outlier_mask.shape[0]:
+                    outlier_mask[start:end, :] = True
+        
+        centroids = None
+        normscale = None
+        normoffset = None
+        
+        if nuq:
+            try:
+                from sklearn.cluster import KMeans
+            except ImportError:
+                logger.warning("sklearn not installed, falling back to uniform quantization")
+                return (outlier_threshold_upper.squeeze().numpy(),
+                        outlier_threshold_lower.squeeze().numpy(),
+                        None, None, None)
+            
+            centroids = []
+            act_distn_np = data_shifted_normalized.flatten()
+            n_cluster = 2 ** self.bits
+            
+            outlier_mask_flat = outlier_mask.flatten()
+            act_distn_np_without_outliers = act_distn_np[~outlier_mask_flat]
+            act_distn_np_without_outliers = act_distn_np_without_outliers.float().cpu().numpy().reshape(-1, 1)
+            
+            # Subsample for efficiency
+            if len(act_distn_np_without_outliers) > 100000:
+                indices = np.random.choice(len(act_distn_np_without_outliers), 100000, replace=False)
+                act_distn_np_without_outliers = act_distn_np_without_outliers[indices]
+            
+            kmeans = KMeans(
+                n_clusters=n_cluster,
+                random_state=0,
+                n_init="auto",
+                max_iter=50
+            ).fit(act_distn_np_without_outliers)
+            
+            centroids.append(kmeans.cluster_centers_.flatten())
+            
+            # Q-Norm
+            if norm:
+                centroid = torch.tensor(centroids[0])
+                aug = data_shifted_normalized.clone()
+                not_outlier_mask = ~outlier_mask
+                
+                m1 = (aug * not_outlier_mask).sum() / not_outlier_mask.sum()
+                stdev1 = torch.sqrt(
+                    torch.sum(((aug - m1) * not_outlier_mask) ** 2) / not_outlier_mask.sum()
+                )
+                
+                aug_quantized = round_to_nearest_pole_sim(aug.flatten(), centroid)
+                aug_quantized = aug_quantized.reshape(aug.shape)
+                
+                m2 = (aug_quantized * not_outlier_mask).sum() / not_outlier_mask.sum()
+                stdev2 = torch.sqrt(
+                    torch.sum(((aug_quantized - m2) * not_outlier_mask) ** 2) / not_outlier_mask.sum()
+                )
+                
+                normscale = (stdev1 / stdev2.clamp(min=1e-8))
+                normoffset = (-m2) * normscale + m1
+        
+        return (outlier_threshold_upper.squeeze().numpy(),
+                outlier_threshold_lower.squeeze().numpy(),
+                centroids, normscale, normoffset)
+    
+    def free(self):
+        """Free memory."""
+        self.out = None
+
+
+# ============================================================================
+# QuantLinearSim - Quantized Linear Layer (from KVQuant)
 # ============================================================================
 
 class QuantLinearSim(nn.Module):
     """
     Simulated quantization for K/V projection layers.
-    EXACTLY replicates KVQuant's QuantLinearSim class.
-    
-    Supports:
-    - Uniform quantization (default)
-    - NUQ (Non-Uniform Quantization) with K-means derived LUT
+    Uses calibrated parameters for static quantization.
+    EXACT copy from KVQuant.
     """
     
-    def __init__(
-        self,
-        name,
-        bits,
-        infeatures,
-        outfeatures,
-        weight,
-        bias,
-        perchannel=True,
-        include_sparse=False,
-        sparsity_threshold=0.999,
-        first_few_fp16=-1,
-        recent_fp16=-1,
-        clamp=False,
-        nuq=False,
-        lut=None
-    ):
+    def __init__(self, name, bits, quantizer, infeatures, outfeatures,
+                 weight, bias, perchannel=True, include_sparse=False,
+                 sparsity_threshold=0.999, dynamicquantization=False,
+                 nuq=False, norm=False, cap_outliers=-1, first_few_fp16=-1, clamp=False):
         super().__init__()
         
         self.name = name
+        self.bits = bits
         self.infeatures = infeatures
         self.outfeatures = outfeatures
-        self.bits = bits
+        self.dynamicquantization = dynamicquantization
+        self.clamp = clamp
         
-        # Store weight TRANSPOSED (same as KVQuant)
+        # Store weight transposed for x @ weight computation
         self.weight = weight.T.detach().clone()
         self.bias = bias.detach().clone() if bias is not None else None
         
-        self.perchannel = perchannel
-        self.qchannel = 0 if perchannel else -1
+        # Quantization parameters
+        if perchannel:
+            self.qchannel = 0
+        else:
+            self.qchannel = -1
+        self.ochannel = self.qchannel
+        
         self.include_sparse = include_sparse
         self.sparsity_threshold = sparsity_threshold
+        
+        # Load calibrated thresholds
+        if quantizer is not None:
+            self.outlier_threshold_upper = torch.tensor(quantizer[0]).flatten().half()
+            self.outlier_threshold_lower = torch.tensor(quantizer[1]).flatten().half()
+            
+            # NUQ LUT
+            self.nuq = nuq
+            if nuq and quantizer[2] is not None:
+                self.lut = quantizer[2]
+            else:
+                self.lut = None
+            
+            # Q-Norm
+            self.norm = norm
+            if norm and len(quantizer) > 3 and quantizer[3] is not None:
+                self.normscale = quantizer[3]
+                self.normoffset = quantizer[4]
+            else:
+                self.normscale = None
+                self.normoffset = None
+        else:
+            # Dynamic mode - no calibrated parameters
+            self.outlier_threshold_upper = None
+            self.outlier_threshold_lower = None
+            self.nuq = nuq
+            self.lut = None
+            self.norm = norm
+            self.normscale = None
+            self.normoffset = None
+        
+        self.cap_outliers = cap_outliers
         self.first_few_fp16 = first_few_fp16
-        self.recent_fp16 = recent_fp16
-        self.clamp = clamp
-        
-        # NUQ settings
-        self.nuq = nuq
-        self.lut = lut  # Lookup table for NUQ (computed via K-means)
-        
-        # For dynamic LUT computation (if not provided)
-        self._calibration_data = []
-        self._lut_computed = False
-    
-    def collect_calibration_data(self, y):
-        """Collect activation data for NUQ LUT computation."""
-        if self.nuq and not self._lut_computed and len(self._calibration_data) < 16:
-            self._calibration_data.append(y.detach().cpu())
-    
-    def compute_lut_from_calibration(self):
-        """Compute NUQ LUT from collected calibration data."""
-        if not self._calibration_data:
-            return
-        
-        all_data = torch.cat(self._calibration_data, dim=0)
-        self.lut = compute_nuq_lut_kmeans(
-            all_data.flatten(), self.bits, self.qchannel,
-            include_sparse=False, outlier_mask=None
-        )
-        self._lut_computed = True
-        self._calibration_data = []  # Free memory
-        logger.debug(f"Computed NUQ LUT for {self.name}: {self.lut}")
     
     def forward(self, x):
         out_shape = x.shape[:-1] + (self.outfeatures,)
         x = x.reshape(-1, x.shape[-1])
         
+        # Move weight to device
         self.weight = self.weight.to(x.device)
         if self.bias is not None:
             self.bias = self.bias.to(x.device)
         
+        # Compute output
         x = x.half()
         y = x @ self.weight
-        y = y + self.bias if self.bias is not None else y
+        if self.bias is not None:
+            y = y + self.bias
         y = y.float()
-        
-        if self.bits >= 16:
-            return y.reshape(out_shape).half()
-        
-        # Collect calibration data for NUQ if needed
-        if self.nuq and not self._lut_computed:
-            self.collect_calibration_data(y)
-            # Compute LUT after enough samples
-            if len(self._calibration_data) >= 8:
-                self.compute_lut_from_calibration()
         
         # Detect outliers
         if self.include_sparse:
-            outlier_mask = get_outliers_dynamic(
-                y, channel=self.qchannel, thresh=self.sparsity_threshold,
-                first_few_fp16=self.first_few_fp16, recent_fp16=self.recent_fp16
-            )
+            if self.dynamicquantization:
+                outlier_mask = get_outliers_dynamic(
+                    y, channel=self.ochannel, thresh=self.sparsity_threshold,
+                    first_few_fp16=self.first_few_fp16
+                )
+            else:
+                self.outlier_threshold_upper = self.outlier_threshold_upper.to(y.device)
+                self.outlier_threshold_lower = self.outlier_threshold_lower.to(y.device)
+                outlier_mask = get_outliers(
+                    y, channel=self.ochannel,
+                    outlier_threshold_upper=self.outlier_threshold_upper,
+                    outlier_threshold_lower=self.outlier_threshold_lower,
+                    cap_outliers=self.cap_outliers,
+                    first_few_fp16=self.first_few_fp16
+                )
         else:
             outlier_mask = None
         
-        # Quantize using NUQ or uniform
+        # Quantize
         if self.nuq and self.lut is not None:
-            y = quant_fn_nuq(
+            y = quant_fn_nuq_recon(
                 y, bits=self.bits, qchannel=self.qchannel,
-                include_sparse=self.include_sparse, outlier_mask=outlier_mask,
-                dynamicquantization=True, lut=self.lut,
-                first_few_fp16=self.first_few_fp16, recent_fp16=self.recent_fp16
+                maxval=self.outlier_threshold_upper,
+                minval=self.outlier_threshold_lower,
+                include_sparse=self.include_sparse,
+                outlier_mask=outlier_mask,
+                dynamicquantization=self.dynamicquantization,
+                lut=self.lut,
+                norm=self.norm,
+                normscale=self.normscale,
+                normoffset=self.normoffset,
+                first_few_fp16=self.first_few_fp16
             )
         else:
             y = quant_fn_zp(
                 y, bits=self.bits, qchannel=self.qchannel,
-                include_sparse=self.include_sparse, outlier_mask=outlier_mask,
-                dynamicquantization=True, clamp=self.clamp,
-                first_few_fp16=self.first_few_fp16, recent_fp16=self.recent_fp16
+                maxval=self.outlier_threshold_upper if not self.dynamicquantization else -1,
+                minval=self.outlier_threshold_lower if not self.dynamicquantization else -1,
+                include_sparse=self.include_sparse,
+                outlier_mask=outlier_mask,
+                dynamicquantization=self.dynamicquantization,
+                clamp=self.clamp
             )
         
+        # Move weight back to CPU to save memory
+        self.weight = self.weight.cpu()
+        if self.bias is not None:
+            self.bias = self.bias.cpu()
+        
         return y.reshape(out_shape).half()
-
-
-# ============================================================================
-# Pre-RoPE Quantization Attention (True KVQuant deployment style)
-# ============================================================================
-
-class PreRoPEQuantAttention(nn.Module):
-    """
-    Attention module with TRUE Pre-RoPE quantization.
-    
-    Quantization happens BEFORE RoPE is applied to keys:
-    1. key_states = k_proj(hidden_states)
-    2. key_states = QUANTIZE(key_states)  <- Pre-RoPE
-    3. key_states = apply_rope(key_states)
-    
-    This matches KVQuant's deployment kernel behavior.
-    """
-    
-    def __init__(self, original_attn, bits, include_sparse=False, 
-                 sparsity_threshold=0.999, first_few_fp16=-1, recent_fp16=-1, clamp=False):
-        super().__init__()
-        
-        # Copy all attributes from original attention
-        self.config = original_attn.config
-        self.layer_idx = original_attn.layer_idx
-        self.attention_dropout = original_attn.attention_dropout
-        self.hidden_size = original_attn.hidden_size
-        self.num_heads = original_attn.num_heads
-        self.head_dim = original_attn.head_dim
-        self.num_key_value_heads = original_attn.num_key_value_heads
-        self.num_key_value_groups = original_attn.num_key_value_groups
-        self.max_position_embeddings = original_attn.max_position_embeddings
-        self.rope_theta = original_attn.rope_theta
-        self.is_causal = original_attn.is_causal
-        
-        # Copy layers
-        self.q_proj = original_attn.q_proj
-        self.k_proj = original_attn.k_proj
-        self.v_proj = original_attn.v_proj
-        self.o_proj = original_attn.o_proj
-        self.rotary_emb = original_attn.rotary_emb
-        
-        # Quantization settings
-        self.bits = bits
-        self.include_sparse = include_sparse
-        self.sparsity_threshold = sparsity_threshold
-        self.first_few_fp16 = first_few_fp16
-        self.recent_fp16 = recent_fp16
-        self.clamp = clamp
-    
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        **kwargs,
-    ):
-        bsz, q_len, _ = hidden_states.size()
-        
-        # Compute Q, K, V projections
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
-        
-        # Reshape
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        
-        # ========== PRE-ROPE QUANTIZATION ==========
-        # Quantize K BEFORE applying RoPE (this is the key difference!)
-        # K: per-channel quantization (qchannel=0 in flattened view means per-head-dim)
-        key_states_flat = key_states.transpose(1, 2).reshape(bsz * q_len, -1)  # [B*T, H*D]
-        key_states_flat = simulated_quantize(
-            key_states_flat, self.bits, qchannel=0,  # per-channel
-            include_sparse=self.include_sparse,
-            sparsity_threshold=self.sparsity_threshold,
-            first_few_fp16=self.first_few_fp16,
-            recent_fp16=self.recent_fp16,
-            clamp=self.clamp
-        )
-        key_states = key_states_flat.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        
-        # V: per-token quantization
-        value_states_flat = value_states.transpose(1, 2).reshape(bsz * q_len, -1)  # [B*T, H*D]
-        value_states_flat = simulated_quantize(
-            value_states_flat, self.bits, qchannel=-1,  # per-token
-            include_sparse=self.include_sparse,
-            sparsity_threshold=self.sparsity_threshold,
-            first_few_fp16=self.first_few_fp16,
-            recent_fp16=self.recent_fp16,
-            clamp=self.clamp
-        )
-        value_states = value_states_flat.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        # ============================================
-        
-        # Get RoPE embeddings
-        if position_embeddings is None:
-            cos, sin = self.rotary_emb(value_states, position_ids)
-        else:
-            cos, sin = position_embeddings
-        
-        # Apply RoPE AFTER quantization
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-        
-        # Handle KV cache
-        if past_key_value is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-        
-        # Repeat KV for GQA
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-        
-        # Attention computation
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-        
-        if attention_mask is not None:
-            causal_mask = attention_mask[:, :, :, :key_states.shape[-2]]
-            attn_weights = attn_weights + causal_mask
-        
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        
-        attn_output = torch.matmul(attn_weights, value_states)
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, -1)
-        attn_output = self.o_proj(attn_output)
-        
-        return attn_output, None, past_key_value
 
 
 # ============================================================================
 # Model Modification Functions
 # ============================================================================
 
-def make_quant_sim(model, bits, perchannel_match=["k_proj"], pertoken_match=["v_proj"],
-                   include_sparse=False, sparsity_threshold=0.999, first_few_fp16=-1, 
-                   recent_fp16=-1, clamp=False, nuq=False):
-    """
-    Replace k_proj/v_proj with QuantLinearSim (simquant mode).
-    
-    Args:
-        model: the model to modify
-        bits: quantization bits
-        perchannel_match: layers to use per-channel quantization
-        pertoken_match: layers to use per-token quantization
-        include_sparse: use dense-and-sparse quantization
-        sparsity_threshold: outlier threshold
-        first_few_fp16: attention sink tokens (KVQuant style)
-        recent_fp16: recent tokens in FP16 (KIVI style)
-        clamp: clamp zero-point
-        nuq: use Non-Uniform Quantization (K-means based LUT)
-    """
-    replaced = 0
-    
-    for name, module in list(model.named_modules()):
-        is_perchannel = any(p in name for p in perchannel_match)
-        is_pertoken = any(p in name for p in pertoken_match)
-        
-        if (is_perchannel or is_pertoken) and isinstance(module, nn.Linear):
-            parts = name.split('.')
-            parent = model
-            for part in parts[:-1]:
-                parent = getattr(parent, part)
-            attr_name = parts[-1]
-            
-            quant_layer = QuantLinearSim(
-                name=name, bits=bits, infeatures=module.in_features,
-                outfeatures=module.out_features, weight=module.weight, bias=module.bias,
-                perchannel=is_perchannel, include_sparse=include_sparse,
-                sparsity_threshold=sparsity_threshold, first_few_fp16=first_few_fp16, 
-                recent_fp16=recent_fp16, clamp=clamp, nuq=nuq
-            )
-            
-            setattr(parent, attr_name, quant_layer)
-            replaced += 1
-    
-    quant_type = "NUQ" if nuq else "Uniform"
-    logger.info(f"Replaced {replaced} layers with QuantLinearSim ({quant_type} quantization)")
-    return model
+def find_layers(module, layers=[nn.Linear], name=''):
+    """Find all layers of specified types."""
+    if type(module) in layers:
+        return {name: module}
+    res = {}
+    for name1, child in module.named_children():
+        res.update(find_layers(child, layers=layers, name=name + '.' + name1 if name != '' else name1))
+    return res
 
 
-def make_pre_rope_quant(model, bits, include_sparse=False, sparsity_threshold=0.999,
-                        first_few_fp16=-1, recent_fp16=-1, clamp=False):
-    """Replace attention modules with PreRoPEQuantAttention (true pre-RoPE mode)."""
-    replaced = 0
+def make_quant_sim(model, quantizers, bits, name='', perchannel=True,
+                   include_sparse=False, sparsity_threshold=0.999,
+                   dynamicquantization=False, nuq=False, norm=False,
+                   cap_outliers=-1, first_few_fp16=-1, clamp=False):
+    """
+    Replace layers with QuantLinearSim using calibrated quantizers.
+    EXACT copy from KVQuant.
+    """
+    if isinstance(model, QuantLinearSim):
+        return
     
-    for name, module in list(model.named_modules()):
-        if isinstance(module, (LlamaAttention, LlamaFlashAttention2, LlamaSdpaAttention)):
-            parts = name.split('.')
-            parent = model
-            for part in parts[:-1]:
-                parent = getattr(parent, part)
-            attr_name = parts[-1]
-            
-            quant_attn = PreRoPEQuantAttention(
-                module, bits, include_sparse=include_sparse,
+    for attr in dir(model):
+        tmp = getattr(model, attr)
+        name1 = name + '.' + attr if name != '' else attr
+        if name1 in quantizers.keys():
+            delattr(model, attr)
+            setattr(model, attr, QuantLinearSim(
+                name1, bits, quantizers[name1],
+                tmp.in_features, tmp.out_features,
+                tmp.weight, tmp.bias,
+                perchannel=perchannel,
+                include_sparse=include_sparse,
                 sparsity_threshold=sparsity_threshold,
-                first_few_fp16=first_few_fp16, recent_fp16=recent_fp16, clamp=clamp
-            )
-            
-            setattr(parent, attr_name, quant_attn)
-            replaced += 1
+                dynamicquantization=dynamicquantization,
+                nuq=nuq, norm=norm,
+                cap_outliers=cap_outliers,
+                first_few_fp16=first_few_fp16,
+                clamp=clamp
+            ))
+        del tmp
     
-    logger.info(f"Replaced {replaced} attention modules with PreRoPEQuantAttention")
-    return model
+    for name1, child in model.named_children():
+        make_quant_sim(
+            child, quantizers, bits,
+            name + '.' + name1 if name != '' else name1,
+            perchannel=perchannel,
+            include_sparse=include_sparse,
+            sparsity_threshold=sparsity_threshold,
+            dynamicquantization=dynamicquantization,
+            nuq=nuq, norm=norm,
+            cap_outliers=cap_outliers,
+            first_few_fp16=first_few_fp16,
+            clamp=clamp
+        )
+
+
+# ============================================================================
+# Calibration Function (from KVQuant llama_simquant.py)
+# ============================================================================
+
+@torch.no_grad()
+def llama_calibration(model, dataloader, dev, perchannel_match, pertoken_match,
+                      bits, include_sparse=False, sparsity_threshold=0.999,
+                      nuq=False, norm=False, cap_outliers=False, first_few_fp16=-1,
+                      nsamples=16):
+    """
+    Run calibration to compute quantization parameters.
+    EXACT copy from KVQuant llama_simquant.py.
+    """
+    logger.info("Starting calibration...")
+    
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+    layers = model.model.layers
+    
+    # Move embeddings to device
+    model.model.embed_tokens = model.model.embed_tokens.to(dev)
+    model.model.norm = model.model.norm.to(dev)
+    layers[0] = layers[0].to(dev)
+    
+    dtype = next(iter(model.parameters())).dtype
+    inps = torch.zeros(
+        (nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
+    )
+    cache = {'i': 0, 'attention_mask': None, 'position_ids': None}
+    
+    class Catcher(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+        
+        def forward(self, inp, **kwargs):
+            inps[cache['i']] = inp
+            cache['i'] += 1
+            cache['attention_mask'] = kwargs.get('attention_mask')
+            cache['position_ids'] = kwargs.get('position_ids')
+            raise ValueError
+    
+    layers[0] = Catcher(layers[0])
+    for batch in dataloader:
+        try:
+            model(batch[0].to(dev))
+        except ValueError:
+            pass
+        if cache['i'] >= nsamples:
+            break
+    layers[0] = layers[0].module
+    
+    # Move back to CPU
+    layers[0] = layers[0].cpu()
+    model.model.embed_tokens = model.model.embed_tokens.cpu()
+    model.model.norm = model.model.norm.cpu()
+    torch.cuda.empty_cache()
+    
+    outs = torch.zeros_like(inps)
+    attention_mask = cache['attention_mask']
+    position_ids = cache['position_ids']
+    
+    logger.info("Quantizing layers...")
+    quantizers = {}
+    
+    for i in tqdm(range(len(layers)), desc="Calibrating layers"):
+        layer = layers[i].to(dev)
+        full = find_layers(layer)
+        
+        # Categorize layers
+        perchannel_list = []
+        pertoken_list = []
+        full_list = []
+        
+        for f in full:
+            for p in perchannel_match:
+                if p in f:
+                    perchannel_list.append(f)
+                    full_list.append(f)
+            for p in pertoken_match:
+                if p in f:
+                    pertoken_list.append(f)
+                    full_list.append(f)
+        
+        sequential = list(full.keys())
+        
+        # Create SimQuant objects
+        simquant = {}
+        subset = {n: full[n] for n in sequential if n in full_list}
+        sequential_subset = list(subset.keys())
+        
+        for name in sequential:
+            if name in perchannel_list:
+                simquant[name] = SimQuant(subset[name], bits, perchannel=True, qchannel=0)
+            elif name in pertoken_list:
+                simquant[name] = SimQuant(subset[name], bits, perchannel=True, qchannel=-1)
+        
+        # Register hooks to collect activations
+        def add_batch(name):
+            def tmp(_, inp, out):
+                simquant[name].add_batch(inp[0].data, out.data)
+            return tmp
+        
+        handles = []
+        for name in sequential_subset:
+            handles.append(subset[name].register_forward_hook(add_batch(name)))
+        
+        # Run forward pass
+        for j in range(nsamples):
+            outs[j] = layer(
+                inps[j].unsqueeze(0),
+                attention_mask=attention_mask,
+                position_ids=position_ids
+            )[0]
+        
+        # Remove hooks
+        for h in handles:
+            h.remove()
+        
+        # Compute quantization parameters
+        for name in subset:
+            cap = cap_outliers if "k_proj" in name else False
+            
+            quantizers['model.layers.%d.%s' % (i, name)] = simquant[name].quantize(
+                include_sparse=include_sparse,
+                sparsity_threshold=sparsity_threshold,
+                nuq=nuq,
+                norm=norm,
+                cap_outliers=cap,
+                first_few_fp16=first_few_fp16,
+                seqlen=model.seqlen
+            )
+            simquant[name].free()
+        
+        layers[i] = layer.cpu()
+        del layer, simquant
+        torch.cuda.empty_cache()
+        
+        inps, outs = outs, inps
+    
+    model.config.use_cache = use_cache
+    return quantizers
+
+
+# ============================================================================
+# Evaluation Function (from KVQuant llama_simquant.py)
+# ============================================================================
+
+@torch.no_grad()
+def llama_eval(model, testenc, dev):
+    """
+    Evaluate model perplexity.
+    EXACT copy from KVQuant llama_simquant.py.
+    """
+    logger.info("Evaluating...")
+    
+    testenc = testenc.input_ids
+    nsamples = testenc.numel() // model.seqlen
+    
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+    layers = model.model.layers
+    
+    # Move embeddings to device
+    model.model.embed_tokens = model.model.embed_tokens.to(dev)
+    layers[0] = layers[0].to(dev)
+    
+    dtype = next(iter(model.parameters())).dtype
+    inps = torch.zeros(
+        (nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
+    )
+    cache = {'i': 0, 'attention_mask': None, 'position_ids': None}
+    
+    class Catcher(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+        
+        def forward(self, inp, **kwargs):
+            inps[cache['i']] = inp
+            cache['i'] += 1
+            cache['attention_mask'] = kwargs.get('attention_mask')
+            cache['position_ids'] = kwargs.get('position_ids')
+            raise ValueError
+    
+    layers[0] = Catcher(layers[0])
+    for i in range(nsamples):
+        batch = testenc[:, (i * model.seqlen):((i + 1) * model.seqlen)].to(dev)
+        try:
+            model(batch)
+        except ValueError:
+            pass
+    layers[0] = layers[0].module
+    
+    layers[0] = layers[0].cpu()
+    model.model.embed_tokens = model.model.embed_tokens.cpu()
+    torch.cuda.empty_cache()
+    
+    outs = torch.zeros_like(inps)
+    attention_mask = cache['attention_mask']
+    position_ids = cache['position_ids']
+    
+    for i in tqdm(range(len(layers)), desc="Evaluating layers"):
+        layer = layers[i].to(dev)
+        
+        for j in range(nsamples):
+            outs[j] = layer(
+                inps[j].unsqueeze(0),
+                attention_mask=attention_mask,
+                position_ids=position_ids
+            )[0]
+        
+        layers[i] = layer.cpu()
+        del layer
+        torch.cuda.empty_cache()
+        inps, outs = outs, inps
+    
+    # Final norm and lm_head
+    model.model.norm = model.model.norm.to(dev)
+    model.lm_head = model.lm_head.to(dev)
+    
+    testenc = testenc.to(dev)
+    nlls = []
+    for i in range(nsamples):
+        hidden_states = inps[i].unsqueeze(0)
+        hidden_states = model.model.norm(hidden_states)
+        lm_logits = model.lm_head(hidden_states)
+        shift_logits = lm_logits[:, :-1, :].contiguous()
+        shift_labels = testenc[:, (i * model.seqlen):((i + 1) * model.seqlen)][:, 1:]
+        loss_fct = nn.CrossEntropyLoss()
+        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        neg_log_likelihood = loss.float() * model.seqlen
+        nlls.append(neg_log_likelihood)
+    
+    ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
+    
+    model.config.use_cache = use_cache
+    return ppl.item()
 
 
 # ============================================================================
 # Data Loading
 # ============================================================================
 
-def get_ppl_eval_loaders(name, tokenizer, seqlen=2048):
-    if "wikitext2" in name:
-        testdata = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-        testenc = tokenizer("\n\n".join(testdata["text"]), return_tensors="pt")
-        return testenc
-    elif "c4" in name:
-        class TokenizerWrapper:
-            def __init__(self, input_ids):
-                self.input_ids = input_ids
-        valdata = load_dataset(
-            "allenai/c4", data_files={"validation": "en/c4-validation.00000-of-00008.json.gz"},
-            revision="607bd4c8450a42878aa9ddc051a65a055450ef87", split="validation"
-        )
-        testenc = tokenizer(' '.join(valdata[:1100]['text']), return_tensors='pt')
-        testenc = testenc.input_ids[:, :(256 * seqlen)]
-        return TokenizerWrapper(testenc)
-    elif "ptb" in name:
-        valdata = load_dataset("ptb-text-only/ptb_text_only", "penn_treebank", split="validation")
-        testenc = tokenizer("\n\n".join(valdata["sentence"]), return_tensors="pt")
-        return testenc
+def get_loaders(dataset_name, nsamples, seed, model_id, seqlen):
+    """Get calibration and test dataloaders."""
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    
+    if dataset_name == 'wikitext2':
+        traindata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
+        testdata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
+        
+        trainenc = tokenizer("\n\n".join(traindata['text']), return_tensors='pt')
+        testenc = tokenizer("\n\n".join(testdata['text']), return_tensors='pt')
+    elif dataset_name == 'c4':
+        traindata = load_dataset('allenai/c4', 'en', split='train', streaming=True)
+        traindata = list(traindata.take(nsamples * 2))
+        
+        import random
+        random.seed(seed)
+        traintext = "\n\n".join([d['text'] for d in traindata])
+        trainenc = tokenizer(traintext, return_tensors='pt')
+        
+        valdata = load_dataset('allenai/c4', 'en', split='validation', streaming=True)
+        valdata = list(valdata.take(256))
+        testtext = "\n\n".join([d['text'] for d in valdata])
+        testenc = tokenizer(testtext, return_tensors='pt')
     else:
-        raise NotImplementedError
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+    
+    # Create calibration dataloader
+    import random
+    random.seed(seed)
+    trainloader = []
+    for _ in range(nsamples):
+        i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
+        j = i + seqlen
+        inp = trainenc.input_ids[:, i:j]
+        trainloader.append((inp,))
+    
+    return trainloader, testenc
 
 
-# ============================================================================
-# PPL Evaluation
-# ============================================================================
-
-@torch.no_grad()
-def eval_ppl(model, tokenizer, model_name, datasets, seqlen=2048, device="cuda", limit=512):
-    model = model.to(device)
-    device = torch.device(device) if isinstance(device, str) else device
-    results = {}
-
-    for dataset in datasets.split(","):
-        dataset = dataset.strip()
-        cache_path = f"/tmp/{dataset}_testloader_{model_name.replace('/', '_')}_all.cache"
-        
-        if os.path.exists(cache_path):
-            testloader = torch.load(cache_path)
-        else:
-            testloader = get_ppl_eval_loaders(dataset, tokenizer, seqlen)
-            torch.save(testloader, cache_path)
-        
-        testenc = testloader.input_ids
-        nsamples = testenc.numel() // seqlen
-        use_cache = model.config.use_cache
-        model.config.use_cache = False
-        model.eval()
-
-        nlls = []
-        for i in tqdm(range(min(nsamples, limit)), desc=f"Evaluating {dataset}"):
-            batch = testenc[:, (i * seqlen): ((i + 1) * seqlen)].to(device)
-            outputs = model.model(batch)
-            hidden_states = outputs[0]
-            logits = model.lm_head(hidden_states)
-            shift_logits = logits[:, :-1, :]
-            shift_labels = testenc[:, (i * seqlen): ((i + 1) * seqlen)][:, 1:].to(device)
-            
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
-            nlls.append(loss.float() * seqlen)
-        
-        ppl = torch.exp(torch.stack(nlls).sum() / (len(nlls) * seqlen))
-        model.config.use_cache = use_cache
-        results[dataset] = ppl.item()
-
-    return results
-
-
-# ============================================================================
-# Model Loading
-# ============================================================================
-
-def get_model(model_path, seqlen, maxseqlen, use_flash_attn=True):
+def get_model(model_id, seqlen, maxseqlen):
+    """Load model with proper RoPE scaling."""
     def skip(*args, **kwargs):
         pass
     torch.nn.init.kaiming_uniform_ = skip
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
-
-    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     
+    config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
     orig_ctx_len = getattr(config, "max_position_embeddings", None)
+    
     if orig_ctx_len and maxseqlen > orig_ctx_len:
         scaling_factor = float(math.ceil(maxseqlen / orig_ctx_len))
         config.rope_scaling = {"type": "linear", "factor": scaling_factor}
-
-    # For pre-RoPE mode, we need eager attention (not flash/sdpa)
-    try:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path, config=config, trust_remote_code=True,
-            attn_implementation="flash_attention_2" if use_flash_attn else "eager",
-            torch_dtype=torch.float16
-        )
-    except:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path, config=config, trust_remote_code=True, torch_dtype=torch.float16
-        )
     
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id, config=config, trust_remote_code=True,
+        torch_dtype=torch.half, device_map='cpu'
+    )
     model.seqlen = seqlen
     model.eval()
-    
-    n_heads = getattr(config, "num_attention_heads", None)
-    n_kv_heads = getattr(config, "num_key_value_heads", None)
-    if n_kv_heads and n_heads and n_kv_heads != n_heads:
-        logger.info(f"GQA: Q heads={n_heads}, KV heads={n_kv_heads}")
     
     return model
 
@@ -864,97 +935,163 @@ def get_model(model_path, seqlen, maxseqlen, use_flash_attn=True):
 # ============================================================================
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="KVQuant-style simulated quantization")
+    parser = argparse.ArgumentParser(description='KVQuant SimQuant PPL Evaluation')
     
-    parser.add_argument('model', type=str, help='Path to LLaMA model')
-    parser.add_argument('--seqlen', type=int, default=2048)
-    parser.add_argument('--maxseqlen', type=int, default=2048)
+    # Model arguments
+    parser.add_argument('model', type=str, help='Model path or HuggingFace model ID')
+    parser.add_argument('--seed', type=int, default=0, help='Random seed')
+    parser.add_argument('--nsamples', type=int, default=16, help='Number of calibration samples')
     
-    # Quantization
-    parser.add_argument('--abits', type=int, default=4, choices=[1, 2, 3, 4, 5, 8, 16],
-                        help='Bits for quantization. WARNING: 1-bit will have very poor quality!')
-    parser.add_argument('--perchannel', type=str, nargs='+', default=["k_proj"])
-    parser.add_argument('--pertoken', type=str, nargs='+', default=["v_proj"])
+    # Quantization arguments
+    parser.add_argument('--quantize', action='store_true', help='Run calibration')
+    parser.add_argument('--abits', type=int, default=16, choices=[2, 3, 4, 5, 16],
+                        help='Quantization bits (16 for baseline)')
+    parser.add_argument('--nuq', action='store_true', help='Use Non-Uniform Quantization')
+    parser.add_argument('--norm', action='store_true', help='Use Q-Norm')
+    
+    # Layer selection
+    parser.add_argument('--perchannel', type=str, default='["k_proj"]',
+                        help='Layers for per-channel quantization (JSON list)')
+    parser.add_argument('--pertoken', type=str, default='["v_proj"]',
+                        help='Layers for per-token quantization (JSON list)')
+    
+    # Sparse quantization
     parser.add_argument('--include_sparse', action='store_true',
-                        help='Use dense-and-sparse quantization (outliers in FP16)')
+                        help='Use dense-and-sparse quantization')
     parser.add_argument('--sparsity_threshold', type=float, default=0.99,
-                        help='Percentile for outlier detection (e.g., 0.99 = 1%% outliers)')
+                        help='Outlier percentile (e.g., 0.99 = 1%% outliers)')
+    
+    # Calibration/quantizer path
+    parser.add_argument('--quantizer_path', type=str, default=None,
+                        help='Path to save/load quantizer parameters')
+    
+    # Attention sink
+    parser.add_argument('--cap_outliers', type=float, default=-1,
+                        help='Max %% outliers per token for keys')
     parser.add_argument('--first_few_fp16', type=int, default=-1,
-                        help='Keep first N tokens in FP16 (attention sink)')
-    parser.add_argument('--recent_fp16', type=int, default=-1,
-                        help='Keep last N tokens in FP16 (like KIVI sliding window)')
-    parser.add_argument('--clamp', action='store_true',
-                        help='Clamp zero-point in integer quantization')
-    parser.add_argument('--nuq', action='store_true',
-                        help='Use Non-Uniform Quantization (NUQ) with K-means derived LUT')
+                        help='Keep first N tokens in FP16')
+    parser.add_argument('--clamp', action='store_true', help='Clamp zero-point')
     
-    # Mode selection
-    parser.add_argument('--pre_rope', action='store_true',
-                        help='Use TRUE pre-RoPE quantization (quantize before RoPE)')
+    # Sequence length
+    parser.add_argument('--seqlen', type=int, default=2048, help='Sequence length')
+    parser.add_argument('--maxseqlen', type=int, default=2048, help='Max sequence length')
     
-    # Evaluation
-    parser.add_argument('--datasets', type=str, default='wikitext2')
-    parser.add_argument('--limit', type=int, default=512)
-    parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--no_flash_attn', action='store_true')
-    parser.add_argument('--verbose', action='store_true')
+    # Dataset
+    parser.add_argument('--dataset', type=str, default='wikitext2',
+                        choices=['wikitext2', 'c4'], help='Dataset for calibration/eval')
     
     args = parser.parse_args()
     
-    logger.remove()
-    logger.add(lambda msg: tqdm.write(msg, end=""), colorize=True,
-               level="DEBUG" if args.verbose else "INFO")
+    import json
+    args.perchannel = json.loads(args.perchannel)
+    args.pertoken = json.loads(args.pertoken)
     
+    DEV = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    
+    # Print configuration
     logger.info("=" * 60)
-    logger.info("KVQuant Simulated Quantization")
+    logger.info("KVQuant SimQuant Configuration")
     logger.info("=" * 60)
     logger.info(f"Model: {args.model}")
     logger.info(f"Bits: {args.abits}")
-    logger.info(f"Quantization type: {'NUQ (Non-Uniform)' if args.nuq else 'Uniform'}")
-    if args.pre_rope:
-        logger.info("Mode: TRUE Pre-RoPE quantization")
-    else:
-        logger.info("Mode: SimQuant (k_proj/v_proj output quantization)")
+    logger.info(f"Mode: {'Calibration' if args.quantize else 'Evaluation'}")
+    logger.info(f"Per-channel layers: {args.perchannel}")
+    logger.info(f"Per-token layers: {args.pertoken}")
+    if args.nuq:
+        logger.info("Using Non-Uniform Quantization (NUQ)")
+    if args.norm:
+        logger.info("Using Q-Norm")
     if args.include_sparse:
         logger.info(f"Sparse: {(1-args.sparsity_threshold)*100:.1f}% outliers in FP16")
     if args.first_few_fp16 > 0:
         logger.info(f"Attention sink: first {args.first_few_fp16} tokens in FP16")
-    if args.recent_fp16 > 0:
-        logger.info(f"Sliding window (KIVI-style): last {args.recent_fp16} tokens in FP16")
     logger.info("=" * 60)
     
     # Load model
     logger.info("Loading model...")
-    # For pre_rope mode, disable flash attention
-    use_flash = not args.no_flash_attn and not args.pre_rope
-    model = get_model(args.model, args.seqlen, args.maxseqlen, use_flash_attn=use_flash)
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    
-    # Apply quantization
-    if args.abits < 16:
-        if args.pre_rope:
-            logger.info("Applying TRUE pre-RoPE quantization...")
-            model = make_pre_rope_quant(
-                model, args.abits, args.include_sparse,
-                args.sparsity_threshold, args.first_few_fp16, args.recent_fp16, args.clamp
-            )
-        else:
-            quant_type = "NUQ" if args.nuq else "uniform"
-            logger.info(f"Applying {args.abits}-bit {quant_type} simquant quantization...")
-            model = make_quant_sim(
-                model, args.abits, args.perchannel, args.pertoken,
-                args.include_sparse, args.sparsity_threshold,
-                args.first_few_fp16, args.recent_fp16, args.clamp, args.nuq
-            )
-    
+    model = get_model(args.model, args.seqlen, args.maxseqlen)
     model = model.half()
+    logger.info("Model loaded.")
     
-    # Evaluate
-    logger.info("Starting evaluation...")
-    results = eval_ppl(model, tokenizer, args.model, args.datasets, args.seqlen, args.device, args.limit)
+    # Load data
+    logger.info("Loading data...")
+    dataloader, testloader = get_loaders(
+        args.dataset, args.nsamples, args.seed, args.model, model.seqlen
+    )
+    logger.info("Data loaded.")
     
-    logger.info("=" * 60)
-    logger.info("Results:")
-    for dataset, ppl in results.items():
-        logger.info(f"  {dataset}: PPL = {ppl:.4f}")
-    logger.info("=" * 60)
+    if args.quantize:
+        # Run calibration
+        quantizers = llama_calibration(
+            model, dataloader, DEV,
+            args.perchannel, args.pertoken, args.abits,
+            include_sparse=args.include_sparse,
+            sparsity_threshold=args.sparsity_threshold,
+            nuq=args.nuq, norm=args.norm,
+            cap_outliers=args.cap_outliers,
+            first_few_fp16=args.first_few_fp16,
+            nsamples=args.nsamples
+        )
+        
+        # Save quantizers
+        if args.quantizer_path:
+            with open(args.quantizer_path, 'wb') as f:
+                pickle.dump(quantizers, f, protocol=pickle.HIGHEST_PROTOCOL)
+            logger.info(f"Quantizers saved to {args.quantizer_path}")
+    
+    else:
+        # Load quantizers and evaluate
+        if args.quantizer_path is None:
+            logger.error("Please provide --quantizer_path for evaluation")
+            exit(1)
+        
+        with open(args.quantizer_path, 'rb') as f:
+            quantizers = pickle.load(f)
+        logger.info(f"Quantizers loaded from {args.quantizer_path}")
+        
+        # Separate per-channel and per-token quantizers
+        perchannelquant = {}
+        pertokenquant = {}
+        
+        for k in quantizers.keys():
+            for p in args.perchannel:
+                if p in k:
+                    perchannelquant[k] = quantizers[k]
+            for p in args.pertoken:
+                if p in k:
+                    pertokenquant[k] = quantizers[k]
+        
+        # Apply per-channel quantization (static - dynamicquantization=False)
+        logger.info("Applying per-channel quantization (K)...")
+        make_quant_sim(
+            model, perchannelquant, args.abits,
+            perchannel=True,
+            include_sparse=args.include_sparse,
+            sparsity_threshold=args.sparsity_threshold,
+            dynamicquantization=False,  # Use calibrated parameters
+            nuq=args.nuq, norm=args.norm,
+            cap_outliers=args.cap_outliers,
+            first_few_fp16=args.first_few_fp16,
+            clamp=args.clamp
+        )
+        
+        # Apply per-token quantization (dynamic - dynamicquantization=True)
+        logger.info("Applying per-token quantization (V)...")
+        make_quant_sim(
+            model, pertokenquant, args.abits,
+            perchannel=False,
+            include_sparse=args.include_sparse,
+            sparsity_threshold=args.sparsity_threshold,
+            dynamicquantization=True,  # Dynamic for values
+            nuq=args.nuq, norm=args.norm,
+            cap_outliers=args.cap_outliers,
+            first_few_fp16=args.first_few_fp16,
+            clamp=args.clamp
+        )
+        
+        # Run evaluation
+        ppl = llama_eval(model, testloader, DEV)
+        
+        logger.info("=" * 60)
+        logger.info(f"Perplexity: {ppl:.4f}")
+        logger.info("=" * 60)
