@@ -920,12 +920,24 @@ def get_model(model_id, seqlen, maxseqlen):
         scaling_factor = float(math.ceil(maxseqlen / orig_ctx_len))
         config.rope_scaling = {"type": "linear", "factor": scaling_factor}
     
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id, config=config, trust_remote_code=True,
-        torch_dtype=torch.half, device_map='cpu'
-    )
+    # Try to use flash attention if available
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, config=config, trust_remote_code=True,
+            torch_dtype=torch.half, device_map='cpu',
+            attn_implementation="flash_attention_2"
+        )
+    except Exception:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, config=config, trust_remote_code=True,
+            torch_dtype=torch.half, device_map='cpu'
+        )
+    
+    # Set seqlen attribute (required by KVQuant)
     model.seqlen = seqlen
     model.eval()
+    
+    logger.info(f"Model seqlen set to: {model.seqlen}")
     
     return model
 
@@ -1011,7 +1023,13 @@ if __name__ == '__main__':
     logger.info("Loading model...")
     model = get_model(args.model, args.seqlen, args.maxseqlen)
     model = model.half()
-    logger.info("Model loaded.")
+    
+    # Ensure seqlen is set (fallback)
+    if not hasattr(model, 'seqlen') or model.seqlen is None:
+        model.seqlen = args.seqlen
+        logger.warning(f"Setting model.seqlen to {args.seqlen}")
+    
+    logger.info(f"Model loaded. seqlen={model.seqlen}")
     
     # Load data
     logger.info("Loading data...")
