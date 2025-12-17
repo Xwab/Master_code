@@ -27,6 +27,9 @@ from modules.kivi_mixed_cache import (
     create_mixed_precision_cache,
     calculate_mixed_precision_split,
 )
+
+# Union type for all KIVI-style caches
+KIVI_CACHE_TYPES = (KIVILatentCache, KIVIMixedPrecisionCache)
 logger = logging.get_logger(__name__)
 
 
@@ -78,7 +81,8 @@ class CustomLlamaSdpaAttention(LlamaSdpaAttention):
         query_states = self.q_proj(hidden_states)
         
         # Check if using KIVI cache (handles quantization internally)
-        use_kivi_cache = isinstance(past_key_value, KIVILatentCache)
+        # Supports both standard KIVILatentCache and KIVIMixedPrecisionCache
+        use_kivi_cache = isinstance(past_key_value, KIVI_CACHE_TYPES)
 
         # Compute low-rank latent representations
         key_latent = self.k_proj.BLinear(hidden_states)  # [bsz, q_len, rank]
@@ -217,7 +221,8 @@ class CustomLlamaFlashAttention2(LlamaFlashAttention2):
         query_states = self.q_proj(hidden_states)
         
         # Check if using KIVI cache (handles quantization internally)
-        use_kivi_cache = isinstance(past_key_value, KIVILatentCache)
+        # Supports both standard KIVILatentCache and KIVIMixedPrecisionCache
+        use_kivi_cache = isinstance(past_key_value, KIVI_CACHE_TYPES)
         
         # Compute low-rank latent representations
         key_latent = self.k_proj.BLinear(hidden_states)  # [bsz, q_len, rank]
@@ -1597,21 +1602,27 @@ class ALRDLlamaForCausalLM(LlamaForCausalLM):
         This makes the model compatible with lm_eval and other evaluation frameworks
         that call model.generate() without explicitly passing a KIVI cache.
         
-        To use KIVI cache, the past_key_values must be an instance of KIVILatentCache.
-        This is checked in attention via: use_kivi_cache = isinstance(past_key_value, KIVILatentCache)
+        To use KIVI cache, the past_key_values must be an instance of KIVILatentCache
+        or KIVIMixedPrecisionCache (for full-rank mixed precision mode).
+        This is checked in attention via: use_kivi_cache = isinstance(past_key_value, KIVI_CACHE_TYPES)
         """
         past_key_values = kwargs.get('past_key_values')
         
         # Check if we should use KIVI cache
-        # NOTE: KIVILatentCache uses fake quantization and does NOT save memory!
+        # NOTE: Both KIVILatentCache and KIVIMixedPrecisionCache use fake quantization and do NOT save memory!
         # Only enable if you explicitly want to test KIVI cache behavior.
         # For memory-efficient inference, use official KIVI with Triton kernels.
         use_kivi_cache = getattr(self, 'use_kivi_cache', False)  # Default: disabled
         
         if use_kivi_cache and self.use_kivi:
-            if kwargs.get('past_key_values') is None or not isinstance(kwargs.get('past_key_values'), KIVILatentCache):
-                kwargs['past_key_values'] = self.create_kivi_cache()
-                print(f"[KIVI] Auto-created KIVILatentCache for generate()")
+            if kwargs.get('past_key_values') is None or not isinstance(kwargs.get('past_key_values'), KIVI_CACHE_TYPES):
+                # Use mixed precision cache if full-rank mixed mode is enabled
+                if self.use_fullrank_mixed_value:
+                    kwargs['past_key_values'] = self.create_mixed_precision_cache()
+                    print(f"[KIVI] Auto-created KIVIMixedPrecisionCache for generate()")
+                else:
+                    kwargs['past_key_values'] = self.create_kivi_cache()
+                    print(f"[KIVI] Auto-created KIVILatentCache for generate()")
             
             if 'use_cache' not in kwargs:
                 kwargs['use_cache'] = True
@@ -1649,20 +1660,25 @@ class ALRDLlamaForCausalLM(LlamaForCausalLM):
         """
         Override forward to automatically use KIVI cache when use_kivi is enabled.
         
-        To use KIVI cache, the past_key_values must be an instance of KIVILatentCache.
-        This is checked in attention via: use_kivi_cache = isinstance(past_key_value, KIVILatentCache)
+        To use KIVI cache, the past_key_values must be an instance of KIVILatentCache
+        or KIVIMixedPrecisionCache (for full-rank mixed precision mode).
+        This is checked in attention via: use_kivi_cache = isinstance(past_key_value, KIVI_CACHE_TYPES)
         """
         # Determine if we should use cache
         use_cache_flag = use_cache if use_cache is not None else self.config.use_cache
         
         # Check if we should use KIVI cache
-        # NOTE: Disabled by default because KIVILatentCache uses fake quantization
+        # NOTE: Disabled by default because KIVI caches use fake quantization
         # and does NOT save memory. Enable with model.use_kivi_cache = True
         use_kivi_cache = getattr(self, 'use_kivi_cache', False)
         
         if use_kivi_cache and self.use_kivi and use_cache_flag:
-            if past_key_values is None or not isinstance(past_key_values, KIVILatentCache):
-                past_key_values = self.create_kivi_cache()
+            if past_key_values is None or not isinstance(past_key_values, KIVI_CACHE_TYPES):
+                # Use mixed precision cache if full-rank mixed mode is enabled
+                if self.use_fullrank_mixed_value:
+                    past_key_values = self.create_mixed_precision_cache()
+                else:
+                    past_key_values = self.create_kivi_cache()
         
         return super().forward(
             input_ids=input_ids,
