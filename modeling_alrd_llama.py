@@ -1536,15 +1536,16 @@ class ALRDLlamaForCausalLM(LlamaForCausalLM):
         past_key_values = kwargs.get('past_key_values')
         
         # Check if we should use KIVI cache
-        # 1. use_kivi is enabled in config
-        # 2. No cache provided, OR cache is not KIVILatentCache
-        if self.use_kivi:
-            if past_key_values is None or not isinstance(past_key_values, KIVILatentCache):
-                # Create KIVI cache automatically
+        # NOTE: KIVILatentCache uses fake quantization and does NOT save memory!
+        # Only enable if you explicitly want to test KIVI cache behavior.
+        # For memory-efficient inference, use official KIVI with Triton kernels.
+        use_kivi_cache = getattr(self, 'use_kivi_cache', False)  # Default: disabled
+        
+        if use_kivi_cache and self.use_kivi:
+            if kwargs.get('past_key_values') is None or not isinstance(kwargs.get('past_key_values'), KIVILatentCache):
                 kwargs['past_key_values'] = self.create_kivi_cache()
                 print(f"[KIVI] Auto-created KIVILatentCache for generate()")
             
-            # Ensure use_cache is True
             if 'use_cache' not in kwargs:
                 kwargs['use_cache'] = True
         
@@ -1588,7 +1589,11 @@ class ALRDLlamaForCausalLM(LlamaForCausalLM):
         use_cache_flag = use_cache if use_cache is not None else self.config.use_cache
         
         # Check if we should use KIVI cache
-        if self.use_kivi and use_cache_flag:
+        # NOTE: Disabled by default because KIVILatentCache uses fake quantization
+        # and does NOT save memory. Enable with model.use_kivi_cache = True
+        use_kivi_cache = getattr(self, 'use_kivi_cache', False)
+        
+        if use_kivi_cache and self.use_kivi and use_cache_flag:
             if past_key_values is None or not isinstance(past_key_values, KIVILatentCache):
                 past_key_values = self.create_kivi_cache()
         
