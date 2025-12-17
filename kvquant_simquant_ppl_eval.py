@@ -446,8 +446,16 @@ class QuantLinearSim(nn.Module):
         self.clamp = clamp
         
         # Store weight transposed for x @ weight computation
-        self.weight = weight.T.detach().clone()
-        self.bias = bias.detach().clone() if bias is not None else None
+        # Use register_buffer so weight moves with .to(device)
+        self.register_buffer('weight', weight.T.detach().clone())
+        if bias is not None:
+            self.register_buffer('bias', bias.detach().clone())
+        else:
+            self.bias = None
+        
+        # Add a dummy parameter so that self.parameters() is not empty
+        # This fixes: next(self.self_attn.parameters()).device in transformers
+        self._dummy_param = nn.Parameter(torch.zeros(1), requires_grad=False)
         
         # Quantization parameters
         if perchannel:
@@ -496,11 +504,7 @@ class QuantLinearSim(nn.Module):
         out_shape = x.shape[:-1] + (self.outfeatures,)
         x = x.reshape(-1, x.shape[-1])
         
-        # Move weight to device
-        self.weight = self.weight.to(x.device)
-        if self.bias is not None:
-            self.bias = self.bias.to(x.device)
-        
+        # Weight and bias are registered as buffers, so they move with the model
         # Compute output
         x = x.half()
         y = x @ self.weight
@@ -553,11 +557,6 @@ class QuantLinearSim(nn.Module):
                 dynamicquantization=self.dynamicquantization,
                 clamp=self.clamp
             )
-        
-        # Move weight back to CPU to save memory
-        self.weight = self.weight.cpu()
-        if self.bias is not None:
-            self.bias = self.bias.cpu()
         
         return y.reshape(out_shape).half()
 
