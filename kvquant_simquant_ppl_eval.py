@@ -1,10 +1,13 @@
 """
 KVQuant-style Simulated Quantization for LLaMA3 with PPL Evaluation
 
-This script combines KVQuant's simulated quantization approach with custom PPL evaluation.
-It supports GQA (Grouped Query Attention) architecture used in LLaMA3.
+This script EXACTLY replicates KVQuant's simulated quantization approach:
+1. Replace k_proj/v_proj with QuantLinearSim
+2. K uses per-channel quantization (qchannel=0)
+3. V uses per-token quantization (qchannel=-1)
+4. Support dense-and-sparse quantization (outlier preservation)
 
-Reference: https://github.com/SqueezeAILab/KVQuant
+Reference: https://github.com/SqueezeAILab/KVQuant/blob/main/quant/kvquant/simquant_module_quantizer.py
 """
 
 import torch
@@ -16,37 +19,26 @@ import os
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from loguru import logger
 import math
-from typing import Optional, Tuple
-import pickle
 
 
 # ============================================================================
-# Quantization Functions (from KVQuant simquant_module_quantizer.py)
+# Quantization Functions - EXACT copy from KVQuant
 # ============================================================================
-
-def round_to_nearest_pole_sim(w, poles):
-    """
-    Round the numbers in w to the nearest value in poles (for NUQ).
-    """
-    stack = []
-    for c in poles:
-        diff = (w - c).abs()
-        stack.append(diff)
-    diff = torch.stack(stack)
-    idx = diff.argmin(axis=0)
-    aug = torch.zeros_like(w)
-    for i, c in enumerate(poles):
-        aug += (idx == i) * c
-    return aug
-
 
 def get_outliers_dynamic(w, channel=-1, thresh=0.999, first_few_fp16=-1):
     """
-    Dynamically detect outliers above/below threshold percentiles.
+    Dynamically detect outliers (from KVQuant simquant_module_quantizer.py)
+    
+    Args:
+        w: activation values (2d matrix)
+        channel: which dimension to compute thresholds along
+        thresh: percentile for outlier threshold (e.g., 0.99 = 1% outliers)
+        first_few_fp16: keep first N tokens in FP16
     """
     t = 1 - ((1 - thresh) / 2)
     w = w.float()
     
+    # Compute upper and lower thresholds
     outlier_threshold_upper = torch.quantile(w, t, dim=channel)
     outlier_threshold_lower = torch.quantile(w, 1 - t, dim=channel)
     
@@ -76,7 +68,17 @@ def quant_fn_zp(
     clamp=False
 ):
     """
-    Performs simulated integer quantization with zero-point.
+    Integer quantization with zero-point (EXACT copy from KVQuant)
+    
+    Args:
+        inp: activation values (2d matrix after reshape)
+        bits: quantization bits
+        qchannel: 0 for per-channel (K), -1 for per-token (V)
+        dynamicquantization: compute min/max online
+        include_sparse: use dense-and-sparse quantization
+        outlier_mask: boolean mask for outlier positions
+        maxval/minval: pre-computed thresholds (if not dynamic)
+        clamp: whether to clamp zero-point
     """
     # Set quantization threshold dynamically
     if dynamicquantization:
@@ -85,118 +87,146 @@ def quant_fn_zp(
             median = torch.median(inp, dim=qchannel).values
             median = median.unsqueeze(qchannel)
             median_mask = median * outlier_mask
+            
+            # Recenter using median to avoid outliers skewing distribution
             tmp_inp = inp - outliers + median_mask
             maxval = torch.max(tmp_inp, dim=qchannel).values
             minval = torch.min(tmp_inp, dim=qchannel).values
         else:
             maxval = torch.max(inp, dim=qchannel).values
             minval = torch.min(inp, dim=qchannel).values
-
-    # Compute scale and offset
+    
+    # Compute scale
     rangeval = (maxval - minval)
-    qx = (2**bits - 1) / rangeval.clamp(min=1e-8)
-
+    qx = (2**bits - 1) / rangeval
+    
+    # Set offset (zero-point)
     if clamp:
         offset = torch.round(minval * qx)
         offset = offset.clamp(-(2**bits - 1), 0)
     else:
+        # This improves accuracy with per-channel key quantization
         offset = minval * qx
-
+    
     offset = offset.unsqueeze(qchannel)
     qx = qx.unsqueeze(qchannel)
-
-    # Handle outlier removal
+    
+    # Handle outlier removal before quantization
     if include_sparse and outlier_mask is not None:
         outliers = inp * outlier_mask
         inp = inp - outliers
-
-    # Quantize and dequantize
+    
+    # Quantize: scale and subtract offset
     qinp = torch.round(qx * inp - offset)
+    
+    # Clipping
     qinp = torch.clip(qinp, min=0, max=2**bits - 1)
+    
+    # Dequantize: rescale
     qinp_out = (qinp + offset) / qx
-
-    # Add outliers back
+    
+    # Add outliers back (they stay in FP16)
     if include_sparse and outlier_mask is not None:
         qinp_out[outlier_mask] = 0
         qinp_out = qinp_out + outliers
-
+    
     qinp_out = torch.nan_to_num(qinp_out, nan=0.0, posinf=0.0, neginf=0.0)
     return qinp_out
 
 
 # ============================================================================
-# Simulated Quantization Linear Layer (KVQuant-style)
+# QuantLinearSim - EXACT replication of KVQuant's implementation
 # ============================================================================
 
 class QuantLinearSim(nn.Module):
     """
-    Simulated quantization wrapper for Linear layers (for K/V projections).
-    This replaces the original k_proj/v_proj and applies fake quantization
-    to the output activations.
+    Simulated quantization for K/V projection layers.
+    EXACTLY replicates KVQuant's QuantLinearSim class.
     """
+    
     def __init__(
         self,
         name,
         bits,
-        original_layer,
+        infeatures,
+        outfeatures,
+        weight,
+        bias,
         perchannel=True,
         include_sparse=False,
         sparsity_threshold=0.999,
         dynamicquantization=True,
-        nuq=False,
         first_few_fp16=-1,
         clamp=False
     ):
         super().__init__()
+        
         self.name = name
+        self.infeatures = infeatures
+        self.outfeatures = outfeatures
         self.bits = bits
-        self.in_features = original_layer.in_features
-        self.out_features = original_layer.out_features
         
-        # Copy weight and bias from original layer
-        self.weight = nn.Parameter(original_layer.weight.data.clone())
-        if original_layer.bias is not None:
-            self.bias = nn.Parameter(original_layer.bias.data.clone())
+        # Store weight TRANSPOSED (same as KVQuant)
+        # KVQuant: self.weight = weight.T.detach().cpu()
+        self.weight = weight.T.detach().clone()
+        
+        if bias is not None:
+            self.bias = bias.detach().clone()
         else:
-            self.register_parameter('bias', None)
+            self.bias = None
         
-        # Quantization settings
         self.perchannel = perchannel
-        self.qchannel = 0 if perchannel else -1  # 0 for per-channel (K), -1 for per-token (V)
+        self.dynamicquantization = dynamicquantization
+        self.clamp = clamp
+        
+        # qchannel: 0 for per-channel (K), -1 for per-token (V)
+        if perchannel:
+            self.qchannel = 0
+        else:
+            self.qchannel = -1
+        
+        self.ochannel = self.qchannel
+        
         self.include_sparse = include_sparse
         self.sparsity_threshold = sparsity_threshold
-        self.dynamicquantization = dynamicquantization
-        self.nuq = nuq
         self.first_few_fp16 = first_few_fp16
-        self.clamp = clamp
-
+    
     def forward(self, x):
-        out_shape = x.shape[:-1] + (self.out_features,)
+        """
+        Forward pass with simulated quantization on output.
+        EXACTLY matches KVQuant's QuantLinearSim.forward()
+        """
+        out_shape = x.shape[:-1] + (self.outfeatures,)
         x = x.reshape(-1, x.shape[-1])
         
-        # Compute linear output
-        x = x.half()
-        y = x @ self.weight.t()
+        # Move weight to device
+        self.weight = self.weight.to(x.device)
         if self.bias is not None:
-            y = y + self.bias
+            self.bias = self.bias.to(x.device)
+        
+        # Compute linear output (KVQuant: y = x @ self.weight)
+        x = x.half()
+        y = x @ self.weight  # weight is already transposed
+        y = y + self.bias if self.bias is not None else y
         y = y.float()
         
         # Skip quantization if bits >= 16
         if self.bits >= 16:
-            return y.reshape(out_shape).half()
+            y = y.reshape(out_shape)
+            return y.half()
         
         # Detect outliers if using dense-and-sparse quantization
         if self.include_sparse:
             outlier_mask = get_outliers_dynamic(
                 y,
-                channel=self.qchannel,
+                channel=self.ochannel,
                 thresh=self.sparsity_threshold,
                 first_few_fp16=self.first_few_fp16
             )
         else:
             outlier_mask = None
         
-        # Apply simulated quantization
+        # Apply simulated quantization (integer quantization)
         y = quant_fn_zp(
             y,
             bits=self.bits,
@@ -212,63 +242,67 @@ class QuantLinearSim(nn.Module):
 
 
 # ============================================================================
-# Model Modification Functions
+# Model Modification - Replace k_proj/v_proj with QuantLinearSim
 # ============================================================================
 
-def replace_with_quant_sim(
+def make_quant_sim(
     model,
     bits,
     perchannel_match=["k_proj"],
     pertoken_match=["v_proj"],
     include_sparse=False,
     sparsity_threshold=0.999,
+    dynamicquantization=True,
     first_few_fp16=-1,
     clamp=False
 ):
     """
-    Replace k_proj and v_proj layers with QuantLinearSim for simulated quantization.
-    Supports GQA architecture (different number of KV heads vs Q heads).
+    Replace k_proj and v_proj layers with QuantLinearSim.
+    Replicates KVQuant's make_quant_sim function.
     """
     replaced_count = 0
     
-    for name, module in model.named_modules():
-        # Check if this is a layer we want to replace
+    for name, module in list(model.named_modules()):
+        # Check if this layer should be quantized
         is_perchannel = any(p in name for p in perchannel_match)
         is_pertoken = any(p in name for p in pertoken_match)
         
         if (is_perchannel or is_pertoken) and isinstance(module, nn.Linear):
             # Find parent module
-            parent_name = '.'.join(name.split('.')[:-1])
-            attr_name = name.split('.')[-1]
-            
+            parts = name.split('.')
             parent = model
-            for part in parent_name.split('.'):
-                if part:
-                    parent = getattr(parent, part)
+            for part in parts[:-1]:
+                parent = getattr(parent, part)
+            attr_name = parts[-1]
             
-            # Create quantized replacement
+            # Create QuantLinearSim replacement
             quant_layer = QuantLinearSim(
                 name=name,
                 bits=bits,
-                original_layer=module,
-                perchannel=is_perchannel,  # per-channel for K, per-token for V
+                infeatures=module.in_features,
+                outfeatures=module.out_features,
+                weight=module.weight,
+                bias=module.bias,
+                perchannel=is_perchannel,  # True for K (per-channel), False for V (per-token)
                 include_sparse=include_sparse,
                 sparsity_threshold=sparsity_threshold,
-                dynamicquantization=True,
+                dynamicquantization=dynamicquantization,
                 first_few_fp16=first_few_fp16,
                 clamp=clamp
             )
             
             setattr(parent, attr_name, quant_layer)
             replaced_count += 1
-            logger.debug(f"Replaced {name} with QuantLinearSim (bits={bits}, perchannel={is_perchannel})")
+            
+            quant_type = "per-channel" if is_perchannel else "per-token"
+            logger.debug(f"Replaced {name} -> QuantLinearSim({bits}bit, {quant_type})")
     
     logger.info(f"Replaced {replaced_count} layers with simulated quantization")
     return model
 
 
 # ============================================================================
-# Data Loading Functions (from your run_ppl_eval.py)
+# Data Loading (from your run_ppl_eval.py)
 # ============================================================================
 
 def get_ppl_eval_loaders(name, tokenizer, seqlen=2048):
@@ -308,7 +342,7 @@ def get_ppl_eval_loaders(name, tokenizer, seqlen=2048):
 
 
 # ============================================================================
-# PPL Evaluation Function (from your run_ppl_eval.py)
+# PPL Evaluation (from your run_ppl_eval.py)
 # ============================================================================
 
 @torch.no_grad()
@@ -364,32 +398,27 @@ def eval_ppl(model, tokenizer, model_name, datasets, seqlen=2048, device="cuda",
 
 
 # ============================================================================
-# Model Loading Function
+# Model Loading
 # ============================================================================
 
 def get_model(model_path, seqlen, maxseqlen, use_flash_attn=True):
-    """
-    Load LLaMA model with proper RoPE scaling for long sequences.
-    Supports LLaMA3 with GQA architecture.
-    """
+    """Load LLaMA model with proper RoPE scaling."""
     def skip(*args, **kwargs):
         pass
     
-    # Skip initialization for faster loading
     torch.nn.init.kaiming_uniform_ = skip
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
 
-    # Load config and set RoPE scaling if needed
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     
+    # RoPE scaling for long sequences
     orig_ctx_len = getattr(config, "max_position_embeddings", None)
     if orig_ctx_len and maxseqlen > orig_ctx_len:
         scaling_factor = float(math.ceil(maxseqlen / orig_ctx_len))
         config.rope_scaling = {"type": "linear", "factor": scaling_factor}
         logger.info(f"Applied RoPE scaling factor: {scaling_factor}")
 
-    # Load model
     attn_impl = "flash_attention_2" if use_flash_attn else "sdpa"
     try:
         model = AutoModelForCausalLM.from_pretrained(
@@ -400,7 +429,7 @@ def get_model(model_path, seqlen, maxseqlen, use_flash_attn=True):
             torch_dtype=torch.float16,
         )
     except Exception as e:
-        logger.warning(f"Failed to load with {attn_impl}, falling back to default: {e}")
+        logger.warning(f"Failed with {attn_impl}, fallback to default: {e}")
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
             config=config,
@@ -412,13 +441,10 @@ def get_model(model_path, seqlen, maxseqlen, use_flash_attn=True):
     model.eval()
     
     # Log GQA info
-    num_attention_heads = getattr(config, "num_attention_heads", None)
-    num_key_value_heads = getattr(config, "num_key_value_heads", None)
-    if num_key_value_heads and num_attention_heads:
-        if num_key_value_heads != num_attention_heads:
-            logger.info(f"GQA detected: Q heads={num_attention_heads}, KV heads={num_key_value_heads}")
-        else:
-            logger.info(f"MHA detected: {num_attention_heads} heads")
+    n_heads = getattr(config, "num_attention_heads", None)
+    n_kv_heads = getattr(config, "num_key_value_heads", None)
+    if n_kv_heads and n_heads and n_kv_heads != n_heads:
+        logger.info(f"GQA detected: Q heads={n_heads}, KV heads={n_kv_heads}")
     
     return model
 
@@ -428,24 +454,26 @@ def get_model(model_path, seqlen, maxseqlen, use_flash_attn=True):
 # ============================================================================
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="KVQuant-style simulated quantization with PPL evaluation")
+    parser = argparse.ArgumentParser(
+        description="KVQuant-style simulated quantization with PPL evaluation"
+    )
     
     # Model arguments
     parser.add_argument('model', type=str, help='Path to LLaMA model')
-    parser.add_argument('--seqlen', type=int, default=2048, help='Sequence length for evaluation')
-    parser.add_argument('--maxseqlen', type=int, default=2048, help='Maximum sequence length for RoPE scaling')
+    parser.add_argument('--seqlen', type=int, default=2048)
+    parser.add_argument('--maxseqlen', type=int, default=2048)
     
-    # Quantization arguments
-    parser.add_argument('--abits', type=int, default=4, choices=[2, 3, 4, 8, 16],
-                        help='Number of bits for KV cache quantization (16 = no quant)')
+    # Quantization arguments (matching KVQuant's interface)
+    parser.add_argument('--abits', type=int, default=4, choices=[2, 3, 4, 5, 8, 16],
+                        help='Quantization bits for KV cache (16=FP16 baseline)')
     parser.add_argument('--perchannel', type=str, nargs='+', default=["k_proj"],
-                        help='Layers to use per-channel (per-head) quantization')
+                        help='Layers using per-channel quantization (default: k_proj)')
     parser.add_argument('--pertoken', type=str, nargs='+', default=["v_proj"],
-                        help='Layers to use per-token quantization')
+                        help='Layers using per-token quantization (default: v_proj)')
     parser.add_argument('--include_sparse', action='store_true',
-                        help='Use dense-and-sparse quantization (keep outliers in FP16)')
+                        help='Use dense-and-sparse quantization (outliers in FP16)')
     parser.add_argument('--sparsity_threshold', type=float, default=0.99,
-                        help='Percentile threshold for outlier detection')
+                        help='Percentile for outlier detection (e.g., 0.99 = 1%% outliers)')
     parser.add_argument('--first_few_fp16', type=int, default=-1,
                         help='Keep first N tokens in FP16 (attention sink)')
     parser.add_argument('--clamp', action='store_true',
@@ -455,15 +483,10 @@ if __name__ == '__main__':
     parser.add_argument('--datasets', type=str, default='wikitext2',
                         help='Datasets to evaluate (comma-separated)')
     parser.add_argument('--limit', type=int, default=512,
-                        help='Maximum number of samples to evaluate')
-    parser.add_argument('--device', type=str, default='cuda', help='Device to run on')
-    parser.add_argument('--no_flash_attn', action='store_true',
-                        help='Disable flash attention')
-    
-    # Misc arguments
-    parser.add_argument('--verbose', action='store_true', help='Enable verbose logging')
-    parser.add_argument('--save_quantizer', type=str, default=None,
-                        help='Path to save quantizer info (for debugging)')
+                        help='Max number of samples to evaluate')
+    parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--no_flash_attn', action='store_true')
+    parser.add_argument('--verbose', action='store_true')
     
     args = parser.parse_args()
     
@@ -477,67 +500,58 @@ if __name__ == '__main__':
     
     # Print configuration
     logger.info("=" * 60)
-    logger.info("KVQuant-style Simulated Quantization for LLaMA3")
+    logger.info("KVQuant Simulated Quantization for LLaMA")
     logger.info("=" * 60)
     logger.info(f"Model: {args.model}")
-    logger.info(f"Quantization bits: {args.abits}")
-    logger.info(f"Per-channel layers: {args.perchannel}")
-    logger.info(f"Per-token layers: {args.pertoken}")
-    logger.info(f"Include sparse: {args.include_sparse}")
+    logger.info(f"Quantization: {args.abits}-bit")
+    logger.info(f"  Per-channel (K): {args.perchannel}")
+    logger.info(f"  Per-token (V): {args.pertoken}")
     if args.include_sparse:
-        logger.info(f"  Sparsity threshold: {args.sparsity_threshold}")
+        outlier_pct = (1 - args.sparsity_threshold) * 100
+        logger.info(f"  Dense-and-sparse: {outlier_pct:.1f}% outliers in FP16")
     if args.first_few_fp16 > 0:
-        logger.info(f"Attention sink (first {args.first_few_fp16} tokens in FP16)")
+        logger.info(f"  Attention sink: first {args.first_few_fp16} tokens in FP16")
     logger.info(f"Datasets: {args.datasets}")
     logger.info(f"Sequence length: {args.seqlen}")
     logger.info("=" * 60)
     
-    # Load model and tokenizer
+    # Load model
     logger.info("Loading model...")
     model = get_model(
-        args.model,
-        args.seqlen,
-        args.maxseqlen,
+        args.model, args.seqlen, args.maxseqlen,
         use_flash_attn=not args.no_flash_attn
     )
-    
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     
     # Apply simulated quantization
     if args.abits < 16:
-        logger.info(f"Applying {args.abits}-bit simulated quantization...")
-        model = replace_with_quant_sim(
+        logger.info(f"Applying {args.abits}-bit KVQuant simulated quantization...")
+        model = make_quant_sim(
             model,
             bits=args.abits,
             perchannel_match=args.perchannel,
             pertoken_match=args.pertoken,
             include_sparse=args.include_sparse,
             sparsity_threshold=args.sparsity_threshold,
+            dynamicquantization=True,
             first_few_fp16=args.first_few_fp16,
             clamp=args.clamp
         )
     else:
-        logger.info("No quantization applied (abits=16)")
+        logger.info("No quantization (FP16 baseline)")
     
-    # Convert to half precision
     model = model.half()
     
-    # Run PPL evaluation
+    # Run evaluation
     logger.info("Starting PPL evaluation...")
     results = eval_ppl(
-        model,
-        tokenizer,
-        args.model,
-        args.datasets,
-        seqlen=args.seqlen,
-        device=args.device,
-        limit=args.limit
+        model, tokenizer, args.model,
+        args.datasets, args.seqlen, args.device, args.limit
     )
     
     # Print results
     logger.info("=" * 60)
     logger.info("Results:")
-    logger.info("=" * 60)
     for dataset, ppl in results.items():
         logger.info(f"  {dataset}: PPL = {ppl:.4f}")
     logger.info("=" * 60)
