@@ -509,21 +509,25 @@ class QuantLinearSim(nn.Module):
         self.first_few_fp16 = first_few_fp16
     
     def forward(self, x):
+        # Save original input device and dtype for output
+        input_device = x.device
+        input_dtype = x.dtype
+        
         out_shape = x.shape[:-1] + (self.outfeatures,)
         x = x.reshape(-1, x.shape[-1])
         
-        # Determine target device - prefer weight's device (should be on GPU if model is on GPU)
-        target_device = self.weight.device
-        target_dtype = torch.float32  # Always compute in float32 for stability
+        # Determine compute device - prefer weight's device (should be on GPU if model is on GPU)
+        compute_device = self.weight.device
+        compute_dtype = torch.float32  # Always compute in float32 for stability
         
-        # Move input to the same device as weight
-        x = x.to(device=target_device, dtype=target_dtype)
-        weight = self.weight.to(dtype=target_dtype)
+        # Move input to compute device
+        x = x.to(device=compute_device, dtype=compute_dtype)
+        weight = self.weight.to(dtype=compute_dtype)
         
         # Compute linear output
         y = x @ weight
         if self.bias is not None:
-            y = y + self.bias.to(dtype=target_dtype)
+            y = y + self.bias.to(dtype=compute_dtype)
         
         # Detect outliers
         outlier_mask = None
@@ -549,11 +553,10 @@ class QuantLinearSim(nn.Module):
         else:
             y = self._quant_uniform(y, outlier_mask)
         
-        # Return in appropriate dtype
-        if target_device.type == 'cuda':
-            return y.reshape(out_shape).half()
-        else:
-            return y.reshape(out_shape).float()
+        # Return output on the SAME device and dtype as input
+        y = y.reshape(out_shape)
+        y = y.to(device=input_device, dtype=input_dtype)
+        return y
     
     def _quant_uniform(self, y, outlier_mask):
         """Uniform quantization with zero-point."""
