@@ -20,6 +20,13 @@ from modules.quant_utils import (
 )
 from modules.hadamard_utils import apply_hadamard
 from modules.kivi_cache import KIVILatentCache, create_kivi_cache
+from modules.kivi_mixed_cache import (
+    KIVIMixedPrecisionQuantizer,
+    ALRDLinear_KIVI_Value_FullRank_Mixed,
+    KIVIMixedPrecisionCache,
+    create_mixed_precision_cache,
+    calculate_mixed_precision_split,
+)
 logger = logging.get_logger(__name__)
 
 
@@ -1402,6 +1409,11 @@ class ALRDLlamaForCausalLM(LlamaForCausalLM):
         self.use_mixed_precision_value = getattr(config, 'use_mixed_precision_value', False)
         self.value_target_ratios = getattr(config, 'value_target_ratios', {})
         self.default_value_target_ratio = getattr(config, 'default_value_target_ratio', 0.25)
+        
+        # Full-rank mixed-precision Value parameters
+        # When True: keep full rank (D), use 4bit+2bit mixed to match low-rank+3bit compression
+        # This replaces low-rank truncation with full-rank mixed-precision quantization
+        self.use_fullrank_mixed_value = getattr(config, 'use_fullrank_mixed_value', False)
 
         full_name_dict = {module: name for name, module in self.named_modules()}
         linear_info = {}
@@ -1437,7 +1449,21 @@ class ALRDLlamaForCausalLM(LlamaForCausalLM):
                             residual_length=self.residual_length,
                         )
                     elif name.endswith('v_proj'):
-                        if self.use_mixed_precision_value:
+                        if self.use_fullrank_mixed_value:
+                            # Full-rank + 4bit/2bit mixed to match low-rank+3bit compression
+                            # This is the user's new scheme:
+                            # - Keep all D features (no truncation)
+                            # - Use 4bit for important features, 2bit for others
+                            # - Match compression: 3r = 4*n_4bit + 2*n_2bit
+                            new_layer = ALRDLinear_KIVI_Value_FullRank_Mixed(
+                                in_features=module.in_features, 
+                                out_features=module.out_features, 
+                                original_rank=rank,  # The rank that would have been used
+                                bias=module.bias is not None,
+                                group_size=self.group_size,
+                                residual_length=self.residual_length,
+                            )
+                        elif self.use_mixed_precision_value:
                             # Use mixed 4bit/2bit quantization for Value
                             target_ratio = self.value_target_ratios.get(
                                 name, self.default_value_target_ratio
@@ -1506,6 +1532,47 @@ class ALRDLlamaForCausalLM(LlamaForCausalLM):
         return create_kivi_cache(
             k_bits=self.k_bits,
             v_bits=self.v_bits,
+            group_size=self.group_size,
+            residual_length=self.residual_length,
+        )
+    
+    def create_mixed_precision_cache(
+        self,
+        out_features: int = None,
+        original_rank: int = None,
+    ) -> KIVIMixedPrecisionCache:
+        """
+        Create a mixed-precision KIVI cache for full-rank Value quantization.
+        
+        This cache uses:
+        - Standard KIVI per-channel quantization for Key
+        - Mixed 4bit/2bit quantization for Value based on singular value importance
+        
+        Args:
+            out_features: Output dimension (D). If None, uses head_dim * num_kv_heads
+            original_rank: The rank that would have been used with 3bit quantization.
+                If None, tries to extract from first layer's v_proj
+        
+        Returns:
+            KIVIMixedPrecisionCache configured for this model
+        """
+        # Try to get parameters from model
+        if out_features is None:
+            out_features = self.config.hidden_size // self.config.num_attention_heads * self.config.num_key_value_heads
+        
+        if original_rank is None:
+            # Try to get from first v_proj layer
+            for name, rank in self.truncation_ranks.items():
+                if 'v_proj' in name:
+                    original_rank = rank
+                    break
+            if original_rank is None:
+                original_rank = out_features // 4  # Default to 25% of features
+        
+        return create_mixed_precision_cache(
+            k_bits=self.k_bits,
+            out_features=out_features,
+            original_rank=original_rank,
             group_size=self.group_size,
             residual_length=self.residual_length,
         )

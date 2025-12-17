@@ -19,7 +19,17 @@ from .kivi_cache import (
     KIVIQuantizer,
     KIVICache,
     KIVIDynamicCache,
+    KIVILatentCache,
     create_kivi_quantizers,
+    create_kivi_cache,
+)
+
+from .kivi_mixed_cache import (
+    KIVIMixedPrecisionQuantizer,
+    ALRDLinear_KIVI_Value_FullRank_Mixed,
+    KIVIMixedPrecisionCache,
+    create_mixed_precision_cache,
+    calculate_mixed_precision_split,
 )
 
 from .svd_linear import SVDLinear
@@ -40,7 +50,15 @@ __all__ = [
     "KIVIQuantizer",
     "KIVICache",
     "KIVIDynamicCache",
+    "KIVILatentCache",
     "create_kivi_quantizers",
+    "create_kivi_cache",
+    # Mixed-precision KIVI (full-rank)
+    "KIVIMixedPrecisionQuantizer",
+    "ALRDLinear_KIVI_Value_FullRank_Mixed",
+    "KIVIMixedPrecisionCache",
+    "create_mixed_precision_cache",
+    "calculate_mixed_precision_split",
     # SVD
     "SVDLinear",
     "apply_hadamard",

@@ -20,12 +20,26 @@ class ALRDLlamaConfig(LlamaConfig):
         residual_length: Number of recent tokens to keep in full precision (default: 32)
         use_kivi: Whether to use KIVI-style quantization (default: True)
         
-        # Mixed-precision Value quantization
+        # Mixed-precision Value quantization (truncated rank)
         use_mixed_precision_value: Whether to use mixed 4bit/2bit for Value (default: False)
         value_target_ratios: Dict mapping layer names to target compression ratios
             e.g., {"model.layers.0.self_attn.v_proj": 0.2, ...}
             If not specified, uses default_value_target_ratio
         default_value_target_ratio: Default target compression ratio for Value (default: 0.25)
+        
+        # Full-rank mixed-precision Value quantization (NEW)
+        use_fullrank_mixed_value: Whether to use full-rank + 4bit/2bit mixed quantization
+            Instead of: low-rank (r) + 3bit uniform quantization
+            Use: full-rank (D) + 4bit/2bit mixed quantization with same compression
+            
+            Compression equivalence:
+            - Original: 3r bits (rank r, 3bit per element)
+            - New: 4*n_4bit + 2*n_2bit bits (full D dimensions)
+            
+            Split calculation:
+            - n_4bit = (3r - 2D) / 2  (features with larger singular values)
+            - n_2bit = (4D - 3r) / 2  (features with smaller singular values)
+            - Valid when: 2D/3 <= r <= 4D/3
         
         # ALinear weight quantization (KIVI-style)
         a_weight_bits: Number of bits for ALinear weight quantization (default: 8)
@@ -46,10 +60,12 @@ class ALRDLlamaConfig(LlamaConfig):
         group_size: int = 128,
         residual_length: int = 32,
         use_kivi: bool = True,
-        # Mixed-precision Value quantization
+        # Mixed-precision Value quantization (truncated rank)
         use_mixed_precision_value: bool = False,
         value_target_ratios: dict = None,
         default_value_target_ratio: float = 0.25,
+        # Full-rank mixed-precision Value quantization (NEW)
+        use_fullrank_mixed_value: bool = False,
         # ALinear weight quantization
         a_weight_bits: int = 8,
         a_weight_group_size: int = 128,
@@ -69,10 +85,13 @@ class ALRDLlamaConfig(LlamaConfig):
         self.residual_length = residual_length
         self.use_kivi = use_kivi
         
-        # Mixed-precision Value parameters
+        # Mixed-precision Value parameters (truncated rank)
         self.use_mixed_precision_value = use_mixed_precision_value
         self.value_target_ratios = value_target_ratios or {}
         self.default_value_target_ratio = default_value_target_ratio
+        
+        # Full-rank mixed-precision Value (NEW)
+        self.use_fullrank_mixed_value = use_fullrank_mixed_value
         
         # ALinear weight quantization
         self.a_weight_bits = a_weight_bits
