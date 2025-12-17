@@ -687,6 +687,51 @@ def find_layers(module, layers=[nn.Linear], name=''):
     return res
 
 
+class DeviceConsistentModel(nn.Module):
+    """
+    Wrapper to ensure all inputs/outputs are on the correct device.
+    This fixes device mismatch issues with lm-eval.
+    """
+    def __init__(self, model, device='cuda:0'):
+        super().__init__()
+        self.model = model
+        self.target_device = torch.device(device)
+        self.config = model.config
+        # Forward other attributes
+        for attr in ['generation_config', 'name_or_path']:
+            if hasattr(model, attr):
+                setattr(self, attr, getattr(model, attr))
+    
+    def forward(self, input_ids=None, attention_mask=None, **kwargs):
+        # Move all inputs to target device
+        if input_ids is not None:
+            input_ids = input_ids.to(self.target_device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self.target_device)
+        
+        # Move any other tensor kwargs
+        for k, v in kwargs.items():
+            if isinstance(v, torch.Tensor):
+                kwargs[k] = v.to(self.target_device)
+        
+        return self.model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+    
+    def generate(self, *args, **kwargs):
+        # Move inputs to device
+        if args:
+            args = tuple(a.to(self.target_device) if isinstance(a, torch.Tensor) else a for a in args)
+        for k, v in kwargs.items():
+            if isinstance(v, torch.Tensor):
+                kwargs[k] = v.to(self.target_device)
+        return self.model.generate(*args, **kwargs)
+    
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.model, name)
+
+
 def make_quant_sim(model, quantizers, bits, name='', perchannel=True,
                    include_sparse=False, sparsity_threshold=0.999,
                    dynamicquantization=False, nuq=False, norm=False,
