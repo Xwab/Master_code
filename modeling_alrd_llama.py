@@ -1589,6 +1589,12 @@ class ALRDLlamaForCausalLM(LlamaForCausalLM):
         else:
             print(f"[KIVI MixedPrecision] No v_proj ranks found, using default_original_rank={default_original_rank}")
         
+        # Get mixed precision options from config
+        match_compression = getattr(self.config, 'mixed_match_compression', True)
+        high_precision_ratio = getattr(self.config, 'mixed_high_precision_ratio', 0.25)
+        high_bits = getattr(self.config, 'mixed_high_bits', 4)
+        low_bits = getattr(self.config, 'mixed_low_bits', 2)
+        
         return create_mixed_precision_cache(
             k_bits=self.k_bits,
             out_features=out_features,
@@ -1596,6 +1602,10 @@ class ALRDLlamaForCausalLM(LlamaForCausalLM):
             default_original_rank=default_original_rank,
             group_size=self.group_size,
             residual_length=self.residual_length,
+            match_compression=match_compression,
+            high_precision_ratio=high_precision_ratio,
+            high_bits=high_bits,
+            low_bits=low_bits,
         )
     
     def generate(

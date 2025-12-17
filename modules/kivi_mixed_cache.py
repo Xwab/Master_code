@@ -33,6 +33,15 @@ class KIVIMixedPrecisionQuantizer(nn.Module):
     and 2bit quantization to features with smaller singular values.
     
     Uses KIVI-style per-token quantization (along hidden dimension).
+    
+    Two modes:
+    1. match_compression=True (default): Match compression ratio with low-rank+3bit
+       - n_4bit = (3r - 2D) / 2
+       - Only effective when r >= 2D/3
+    
+    2. match_compression=False: Use fixed ratio of high precision
+       - n_4bit = high_precision_ratio * D
+       - Always uses some 4bit features
     """
     
     def __init__(
@@ -40,50 +49,64 @@ class KIVIMixedPrecisionQuantizer(nn.Module):
         out_features: int,
         original_rank: int,
         group_size: int = 128,
+        match_compression: bool = True,
+        high_precision_ratio: float = 0.25,  # Used when match_compression=False
+        high_bits: int = 4,
+        low_bits: int = 2,
     ):
         super().__init__()
         self.out_features = out_features
         self.original_rank = original_rank
         self.group_size = group_size
-        
-        # Calculate n_4bit and n_2bit to match compression ratio
-        # Original: rank * 3bit
-        # New: n_4bit * 4bit + n_2bit * 2bit
-        # Constraint: 3r = 4 * n_4bit + 2 * n_2bit, n_4bit + n_2bit = D
+        self.match_compression = match_compression
+        self.high_bits = high_bits
+        self.low_bits = low_bits
         
         D = out_features
         r = original_rank
         
-        # n_4bit = (3r - 2D) / 2
-        n_4bit_float = (3 * r - 2 * D) / 2
-        
-        if n_4bit_float < 0:
-            # Compression too high, need even lower precision
-            # Use all 2bit
-            self.n_4bit = 0
-            self.n_2bit = D
-            print(f"[MixedQuant] Warning: rank={r} too small for 4bit+2bit, using all 2bit")
-        elif n_4bit_float > D:
-            # Compression too low, use all 4bit
-            self.n_4bit = D
-            self.n_2bit = 0
-            print(f"[MixedQuant] Warning: rank={r} too large, using all 4bit")
+        if match_compression:
+            # Mode 1: Match compression ratio with low-rank + 3bit
+            # Original: rank * 3bit
+            # New: n_high * high_bits + n_low * low_bits
+            # Constraint: 3r = high_bits * n_high + low_bits * n_low, n_high + n_low = D
+            # n_high = (3r - low_bits * D) / (high_bits - low_bits)
+            
+            n_high_float = (3 * r - self.low_bits * D) / (self.high_bits - self.low_bits)
+            
+            if n_high_float < 0:
+                # Compression too high, use all low_bits
+                self.n_4bit = 0
+                self.n_2bit = D
+                self.effective_mode = "all_low"
+            elif n_high_float > D:
+                # Compression too low, use all high_bits
+                self.n_4bit = D
+                self.n_2bit = 0
+                self.effective_mode = "all_high"
+            else:
+                self.n_4bit = int(n_high_float)
+                self.n_2bit = D - self.n_4bit
+                self.effective_mode = "mixed"
         else:
-            self.n_4bit = int(n_4bit_float)
+            # Mode 2: Fixed ratio of high precision
+            # Always use high_precision_ratio of features at high precision
+            self.n_4bit = int(D * high_precision_ratio)
             self.n_2bit = D - self.n_4bit
+            self.effective_mode = "fixed_ratio"
         
         # Align to group_size for efficient quantization
         if group_size > 0 and self.n_4bit > 0 and self.n_4bit < D:
             self.n_4bit = (self.n_4bit // group_size) * group_size
             self.n_2bit = D - self.n_4bit
         
-        # Calculate actual compression ratio
-        actual_bits = (4 * self.n_4bit + 2 * self.n_2bit) / D
+        # Calculate actual average bits
+        self.avg_bits = (self.high_bits * self.n_4bit + self.low_bits * self.n_2bit) / D
         original_bits = 3 * r / D
         
-        print(f"[MixedQuant] out_features={D}, original_rank={r}")
-        print(f"[MixedQuant] n_4bit={self.n_4bit}, n_2bit={self.n_2bit}")
-        print(f"[MixedQuant] Original avg bits: {original_bits:.2f}, Actual avg bits: {actual_bits:.2f}")
+        print(f"[MixedQuant] out_features={D}, original_rank={r}, mode={self.effective_mode}")
+        print(f"[MixedQuant] n_{self.high_bits}bit={self.n_4bit}, n_{self.low_bits}bit={self.n_2bit}")
+        print(f"[MixedQuant] Target avg bits: {original_bits:.2f}, Actual avg bits: {self.avg_bits:.2f}")
     
     @torch.no_grad()
     def quantize_4bit(self, x: torch.Tensor) -> torch.Tensor:
@@ -373,6 +396,11 @@ class KIVIMixedPrecisionCache(Cache):
         default_original_rank: int = 256,  # Fallback if layer not in dict
         group_size: int = 128,
         residual_length: int = 128,
+        # Mixed precision options
+        match_compression: bool = True,  # Match compression with low-rank+3bit
+        high_precision_ratio: float = 0.25,  # Used when match_compression=False
+        high_bits: int = 4,  # High precision bits
+        low_bits: int = 2,   # Low precision bits
     ):
         super().__init__()
         self.k_bits = k_bits
@@ -381,6 +409,12 @@ class KIVIMixedPrecisionCache(Cache):
         self.default_original_rank = default_original_rank
         self.group_size = group_size
         self.residual_length = residual_length
+        
+        # Mixed precision options
+        self.match_compression = match_compression
+        self.high_precision_ratio = high_precision_ratio
+        self.high_bits = high_bits
+        self.low_bits = low_bits
         
         # Key quantizer (standard KIVI per-channel) - same for all layers
         self.key_quantizer = KIVIKeyQuantizer(n_bits=k_bits, group_size=group_size)
@@ -402,6 +436,10 @@ class KIVIMixedPrecisionCache(Cache):
                 out_features=self.out_features,
                 original_rank=original_rank,
                 group_size=self.group_size,
+                match_compression=self.match_compression,
+                high_precision_ratio=self.high_precision_ratio,
+                high_bits=self.high_bits,
+                low_bits=self.low_bits,
             )
         
         return self._value_quantizers[layer_idx]
@@ -636,6 +674,11 @@ def create_mixed_precision_cache(
     default_original_rank: int = 256,
     group_size: int = 128,
     residual_length: int = 128,
+    # Mixed precision options
+    match_compression: bool = True,
+    high_precision_ratio: float = 0.25,
+    high_bits: int = 4,
+    low_bits: int = 2,
 ) -> KIVIMixedPrecisionCache:
     """
     Create a mixed-precision KIVI cache with per-layer rank support.
@@ -649,6 +692,11 @@ def create_mixed_precision_cache(
         default_original_rank: Fallback rank if layer not in layer_original_ranks
         group_size: Group size for quantization
         residual_length: Number of recent tokens to keep in full precision
+        match_compression: If True, match compression ratio with low-rank+3bit
+            Note: Only works when rank >= 2D/3. If rank < 2D/3, falls back to all low_bits.
+        high_precision_ratio: When match_compression=False, use this ratio of high precision
+        high_bits: Number of bits for high precision (default 4)
+        low_bits: Number of bits for low precision (default 2)
     
     Returns:
         KIVIMixedPrecisionCache configured with per-layer ranks
@@ -660,6 +708,10 @@ def create_mixed_precision_cache(
         default_original_rank=default_original_rank,
         group_size=group_size,
         residual_length=residual_length,
+        match_compression=match_compression,
+        high_precision_ratio=high_precision_ratio,
+        high_bits=high_bits,
+        low_bits=low_bits,
     )
 
 

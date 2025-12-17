@@ -93,6 +93,14 @@ class ALRDLlamaConfig(LlamaConfig):
         # Full-rank mixed-precision Value (NEW)
         self.use_fullrank_mixed_value = use_fullrank_mixed_value
         
+        # Mixed precision quantization options
+        # match_compression=True: 匹配低秩+3bit的压缩率 (只有当 rank >= 2D/3 时有效)
+        # match_compression=False: 使用固定比例的高精度
+        self.mixed_match_compression = kwargs.pop('mixed_match_compression', True)
+        self.mixed_high_precision_ratio = kwargs.pop('mixed_high_precision_ratio', 0.25)
+        self.mixed_high_bits = kwargs.pop('mixed_high_bits', 4)
+        self.mixed_low_bits = kwargs.pop('mixed_low_bits', 2)
+        
         # ALinear weight quantization
         self.a_weight_bits = a_weight_bits
         self.a_weight_group_size = a_weight_group_size
