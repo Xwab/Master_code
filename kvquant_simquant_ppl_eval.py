@@ -34,6 +34,180 @@ from typing import Optional, Tuple
 # Quantization Functions - EXACT copy from KVQuant
 # ============================================================================
 
+def round_to_nearest_pole_sim(w, poles):
+    """
+    Round the numbers in w to the nearest value in poles (for NUQ).
+    
+    Args:
+        w: activation values (flattened tensor)
+        poles: tensor of quantization levels (centroids from K-means)
+    
+    Returns:
+        Tensor with each value replaced by nearest pole
+    """
+    stack = []
+    for c in poles:
+        diff = (w - c).abs()
+        stack.append(diff)
+    diff = torch.stack(stack)
+    idx = diff.argmin(axis=0)
+    
+    aug = torch.zeros_like(w)
+    for i, c in enumerate(poles):
+        aug += (idx == i) * c
+    
+    return aug
+
+
+def compute_nuq_lut_kmeans(activations, bits, qchannel=-1, include_sparse=False, 
+                           outlier_mask=None, num_samples=50000):
+    """
+    Compute NUQ lookup table using K-means clustering.
+    This is the core of KVQuant's non-uniform quantization.
+    
+    Args:
+        activations: collected activation values
+        bits: number of quantization bits
+        qchannel: quantization channel
+        include_sparse: whether using sparse quantization
+        outlier_mask: mask for outliers to exclude
+        num_samples: max samples for K-means
+    
+    Returns:
+        LUT (lookup table) with 2^bits centroids
+    """
+    try:
+        from sklearn.cluster import KMeans
+    except ImportError:
+        logger.warning("sklearn not installed, falling back to uniform quantization")
+        return None
+    
+    # Normalize to [-1, 1]
+    if include_sparse and outlier_mask is not None:
+        clean_acts = activations[~outlier_mask]
+    else:
+        clean_acts = activations.flatten()
+    
+    # Compute range for normalization
+    maxval = clean_acts.max()
+    minval = clean_acts.min()
+    rangeval = (maxval - minval) / 2
+    offset = (maxval + minval) / 2
+    
+    # Normalize
+    normalized = ((clean_acts - offset) / rangeval).cpu().numpy()
+    
+    # Subsample for efficiency
+    if len(normalized) > num_samples:
+        import numpy as np
+        indices = np.random.choice(len(normalized), num_samples, replace=False)
+        normalized = normalized[indices]
+    
+    normalized = normalized.reshape(-1, 1)
+    
+    # K-means clustering
+    n_clusters = 2 ** bits
+    kmeans = KMeans(
+        n_clusters=n_clusters,
+        random_state=0,
+        n_init="auto",
+        max_iter=50
+    ).fit(normalized)
+    
+    # Get centroids (sorted)
+    centroids = torch.tensor(kmeans.cluster_centers_.flatten()).sort().values
+    
+    return centroids
+
+
+def quant_fn_nuq(
+    inp,
+    bits=8,
+    qchannel=-1,
+    dynamicquantization=True,
+    include_sparse=False,
+    outlier_mask=None,
+    lut=None,
+    first_few_fp16=-1
+):
+    """
+    Non-Uniform Quantization (NUQ) using lookup table.
+    
+    This is KVQuant's quant_fn_nuq_recon implementation:
+    1. Normalize input to [-1, 1]
+    2. Map each value to nearest LUT entry
+    3. De-normalize back to original range
+    
+    Args:
+        inp: input tensor
+        bits: quantization bits
+        qchannel: quantization channel (0=per-channel, -1=per-token)
+        dynamicquantization: compute range dynamically
+        include_sparse: use sparse quantization
+        outlier_mask: outlier positions
+        lut: lookup table (centroids)
+        first_few_fp16: keep first N tokens in FP16
+    """
+    if lut is None:
+        # Fall back to uniform quantization if no LUT
+        return quant_fn_zp(inp, bits, qchannel, dynamicquantization, 
+                          include_sparse, outlier_mask)
+    
+    orig_inp = inp.clone() if first_few_fp16 > -1 else None
+    
+    # Compute range dynamically
+    if dynamicquantization:
+        if include_sparse and outlier_mask is not None:
+            outliers = inp * outlier_mask
+            median = torch.median(inp, dim=qchannel).values.unsqueeze(qchannel)
+            median_mask = median * outlier_mask
+            tmp_inp = inp - outliers + median_mask
+            maxval = torch.max(tmp_inp, dim=qchannel).values
+            minval = torch.min(tmp_inp, dim=qchannel).values
+        else:
+            maxval = torch.max(inp, dim=qchannel).values
+            minval = torch.min(inp, dim=qchannel).values
+    
+    # Compute offset and range
+    offset = (maxval + minval) / 2
+    rangeval = (maxval - minval) / 2
+    offset = offset.unsqueeze(qchannel)
+    rangeval = rangeval.unsqueeze(qchannel)
+    
+    # Subtract offset to center around 0
+    inp = inp - offset
+    
+    # Handle outliers
+    if include_sparse and outlier_mask is not None:
+        outliers = inp * outlier_mask
+        inp = inp - outliers
+    
+    # Normalize to [-1, 1]
+    inp_scaled = inp / rangeval.clamp(min=1e-8)
+    
+    # Round to nearest LUT entry
+    lut_device = lut.to(inp_scaled.device).float()
+    Q = round_to_nearest_pole_sim(inp_scaled.flatten(), lut_device)
+    qinp_out = Q.reshape(inp.shape).to(inp_scaled.dtype)
+    
+    # De-normalize
+    qinp_out = qinp_out * rangeval
+    
+    # Add outliers back
+    if include_sparse and outlier_mask is not None:
+        qinp_out[outlier_mask] = 0
+        qinp_out = qinp_out + outliers
+    
+    # Shift by offset
+    qinp_out = qinp_out + offset
+    
+    # Keep first few tokens in FP16
+    if first_few_fp16 > -1 and orig_inp is not None:
+        qinp_out[:first_few_fp16, :] = orig_inp[:first_few_fp16, :]
+    
+    return torch.nan_to_num(qinp_out, nan=0.0, posinf=0.0, neginf=0.0)
+
+
 def get_outliers_dynamic(w, channel=-1, thresh=0.999, first_few_fp16=-1):
     """
     Dynamically detect outliers (from KVQuant simquant_module_quantizer.py)
@@ -209,6 +383,10 @@ class QuantLinearSim(nn.Module):
     """
     Simulated quantization for K/V projection layers.
     EXACTLY replicates KVQuant's QuantLinearSim class.
+    
+    Supports:
+    - Uniform quantization (default)
+    - NUQ (Non-Uniform Quantization) with K-means derived LUT
     """
     
     def __init__(
@@ -223,7 +401,9 @@ class QuantLinearSim(nn.Module):
         include_sparse=False,
         sparsity_threshold=0.999,
         first_few_fp16=-1,
-        clamp=False
+        clamp=False,
+        nuq=False,
+        lut=None
     ):
         super().__init__()
         
@@ -242,6 +422,33 @@ class QuantLinearSim(nn.Module):
         self.sparsity_threshold = sparsity_threshold
         self.first_few_fp16 = first_few_fp16
         self.clamp = clamp
+        
+        # NUQ settings
+        self.nuq = nuq
+        self.lut = lut  # Lookup table for NUQ (computed via K-means)
+        
+        # For dynamic LUT computation (if not provided)
+        self._calibration_data = []
+        self._lut_computed = False
+    
+    def collect_calibration_data(self, y):
+        """Collect activation data for NUQ LUT computation."""
+        if self.nuq and not self._lut_computed and len(self._calibration_data) < 16:
+            self._calibration_data.append(y.detach().cpu())
+    
+    def compute_lut_from_calibration(self):
+        """Compute NUQ LUT from collected calibration data."""
+        if not self._calibration_data:
+            return
+        
+        all_data = torch.cat(self._calibration_data, dim=0)
+        self.lut = compute_nuq_lut_kmeans(
+            all_data.flatten(), self.bits, self.qchannel,
+            include_sparse=False, outlier_mask=None
+        )
+        self._lut_computed = True
+        self._calibration_data = []  # Free memory
+        logger.debug(f"Computed NUQ LUT for {self.name}: {self.lut}")
     
     def forward(self, x):
         out_shape = x.shape[:-1] + (self.outfeatures,)
@@ -259,6 +466,13 @@ class QuantLinearSim(nn.Module):
         if self.bits >= 16:
             return y.reshape(out_shape).half()
         
+        # Collect calibration data for NUQ if needed
+        if self.nuq and not self._lut_computed:
+            self.collect_calibration_data(y)
+            # Compute LUT after enough samples
+            if len(self._calibration_data) >= 8:
+                self.compute_lut_from_calibration()
+        
         # Detect outliers
         if self.include_sparse:
             outlier_mask = get_outliers_dynamic(
@@ -268,12 +482,20 @@ class QuantLinearSim(nn.Module):
         else:
             outlier_mask = None
         
-        # Quantize
-        y = quant_fn_zp(
-            y, bits=self.bits, qchannel=self.qchannel,
-            include_sparse=self.include_sparse, outlier_mask=outlier_mask,
-            dynamicquantization=True, clamp=self.clamp
-        )
+        # Quantize using NUQ or uniform
+        if self.nuq and self.lut is not None:
+            y = quant_fn_nuq(
+                y, bits=self.bits, qchannel=self.qchannel,
+                include_sparse=self.include_sparse, outlier_mask=outlier_mask,
+                dynamicquantization=True, lut=self.lut,
+                first_few_fp16=self.first_few_fp16
+            )
+        else:
+            y = quant_fn_zp(
+                y, bits=self.bits, qchannel=self.qchannel,
+                include_sparse=self.include_sparse, outlier_mask=outlier_mask,
+                dynamicquantization=True, clamp=self.clamp
+            )
         
         return y.reshape(out_shape).half()
 
@@ -415,8 +637,22 @@ class PreRoPEQuantAttention(nn.Module):
 # ============================================================================
 
 def make_quant_sim(model, bits, perchannel_match=["k_proj"], pertoken_match=["v_proj"],
-                   include_sparse=False, sparsity_threshold=0.999, first_few_fp16=-1, clamp=False):
-    """Replace k_proj/v_proj with QuantLinearSim (simquant mode)."""
+                   include_sparse=False, sparsity_threshold=0.999, first_few_fp16=-1, 
+                   clamp=False, nuq=False):
+    """
+    Replace k_proj/v_proj with QuantLinearSim (simquant mode).
+    
+    Args:
+        model: the model to modify
+        bits: quantization bits
+        perchannel_match: layers to use per-channel quantization
+        pertoken_match: layers to use per-token quantization
+        include_sparse: use dense-and-sparse quantization
+        sparsity_threshold: outlier threshold
+        first_few_fp16: attention sink tokens
+        clamp: clamp zero-point
+        nuq: use Non-Uniform Quantization (K-means based LUT)
+    """
     replaced = 0
     
     for name, module in list(model.named_modules()):
@@ -434,13 +670,15 @@ def make_quant_sim(model, bits, perchannel_match=["k_proj"], pertoken_match=["v_
                 name=name, bits=bits, infeatures=module.in_features,
                 outfeatures=module.out_features, weight=module.weight, bias=module.bias,
                 perchannel=is_perchannel, include_sparse=include_sparse,
-                sparsity_threshold=sparsity_threshold, first_few_fp16=first_few_fp16, clamp=clamp
+                sparsity_threshold=sparsity_threshold, first_few_fp16=first_few_fp16, 
+                clamp=clamp, nuq=nuq
             )
             
             setattr(parent, attr_name, quant_layer)
             replaced += 1
     
-    logger.info(f"Replaced {replaced} layers with QuantLinearSim (simquant mode)")
+    quant_type = "NUQ" if nuq else "Uniform"
+    logger.info(f"Replaced {replaced} layers with QuantLinearSim ({quant_type} quantization)")
     return model
 
 
@@ -601,10 +839,16 @@ if __name__ == '__main__':
                         help='Bits for quantization. WARNING: 1-bit will have very poor quality!')
     parser.add_argument('--perchannel', type=str, nargs='+', default=["k_proj"])
     parser.add_argument('--pertoken', type=str, nargs='+', default=["v_proj"])
-    parser.add_argument('--include_sparse', action='store_true')
-    parser.add_argument('--sparsity_threshold', type=float, default=0.99)
-    parser.add_argument('--first_few_fp16', type=int, default=-1)
-    parser.add_argument('--clamp', action='store_true')
+    parser.add_argument('--include_sparse', action='store_true',
+                        help='Use dense-and-sparse quantization (outliers in FP16)')
+    parser.add_argument('--sparsity_threshold', type=float, default=0.99,
+                        help='Percentile for outlier detection (e.g., 0.99 = 1%% outliers)')
+    parser.add_argument('--first_few_fp16', type=int, default=-1,
+                        help='Keep first N tokens in FP16 (attention sink)')
+    parser.add_argument('--clamp', action='store_true',
+                        help='Clamp zero-point in integer quantization')
+    parser.add_argument('--nuq', action='store_true',
+                        help='Use Non-Uniform Quantization (NUQ) with K-means derived LUT')
     
     # Mode selection
     parser.add_argument('--pre_rope', action='store_true',
@@ -628,12 +872,15 @@ if __name__ == '__main__':
     logger.info("=" * 60)
     logger.info(f"Model: {args.model}")
     logger.info(f"Bits: {args.abits}")
+    logger.info(f"Quantization type: {'NUQ (Non-Uniform)' if args.nuq else 'Uniform'}")
     if args.pre_rope:
         logger.info("Mode: TRUE Pre-RoPE quantization")
     else:
         logger.info("Mode: SimQuant (k_proj/v_proj output quantization)")
     if args.include_sparse:
         logger.info(f"Sparse: {(1-args.sparsity_threshold)*100:.1f}% outliers in FP16")
+    if args.first_few_fp16 > 0:
+        logger.info(f"Attention sink: first {args.first_few_fp16} tokens in FP16")
     logger.info("=" * 60)
     
     # Load model
@@ -652,11 +899,12 @@ if __name__ == '__main__':
                 args.sparsity_threshold, args.first_few_fp16, args.clamp
             )
         else:
-            logger.info("Applying simquant quantization...")
+            quant_type = "NUQ" if args.nuq else "uniform"
+            logger.info(f"Applying {args.abits}-bit {quant_type} simquant quantization...")
             model = make_quant_sim(
                 model, args.abits, args.perchannel, args.pertoken,
                 args.include_sparse, args.sparsity_threshold,
-                args.first_few_fp16, args.clamp
+                args.first_few_fp16, args.clamp, args.nuq
             )
     
     model = model.half()
