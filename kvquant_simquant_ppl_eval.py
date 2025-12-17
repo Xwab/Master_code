@@ -58,6 +58,41 @@ def get_outliers_dynamic(w, channel=-1, thresh=0.999, first_few_fp16=-1):
     return outlier_mask
 
 
+def quant_fn_1bit(inp, qchannel=-1, include_sparse=False, outlier_mask=None):
+    """
+    1-bit quantization (binarization) using mean as threshold.
+    
+    This is a simple sign-based binarization:
+    - Values >= mean -> max
+    - Values < mean -> min
+    
+    Note: 1-bit quantization has very poor quality for KV cache!
+    """
+    if include_sparse and outlier_mask is not None:
+        outliers = inp * outlier_mask
+        inp_clean = inp - outliers
+    else:
+        inp_clean = inp
+        outliers = None
+    
+    # Compute threshold (mean along quantization channel)
+    threshold = torch.mean(inp_clean, dim=qchannel, keepdim=True)
+    
+    # Compute min/max for reconstruction
+    maxval = torch.max(inp_clean, dim=qchannel, keepdim=True).values
+    minval = torch.min(inp_clean, dim=qchannel, keepdim=True).values
+    
+    # Binarize: >= threshold -> maxval, < threshold -> minval
+    qinp_out = torch.where(inp_clean >= threshold, maxval, minval)
+    
+    # Add outliers back
+    if include_sparse and outliers is not None:
+        qinp_out[outlier_mask] = 0
+        qinp_out = qinp_out + outliers
+    
+    return torch.nan_to_num(qinp_out, nan=0.0, posinf=0.0, neginf=0.0)
+
+
 def quant_fn_zp(
     inp,
     bits=8,
@@ -71,7 +106,12 @@ def quant_fn_zp(
 ):
     """
     Integer quantization with zero-point (EXACT copy from KVQuant)
+    Extended to support 1-bit quantization.
     """
+    # Special handling for 1-bit
+    if bits == 1:
+        return quant_fn_1bit(inp, qchannel, include_sparse, outlier_mask)
+    
     if dynamicquantization:
         if include_sparse and outlier_mask is not None:
             outliers = inp * outlier_mask
@@ -557,7 +597,8 @@ if __name__ == '__main__':
     parser.add_argument('--maxseqlen', type=int, default=2048)
     
     # Quantization
-    parser.add_argument('--abits', type=int, default=4, choices=[2, 3, 4, 5, 8, 16])
+    parser.add_argument('--abits', type=int, default=4, choices=[1, 2, 3, 4, 5, 8, 16],
+                        help='Bits for quantization. WARNING: 1-bit will have very poor quality!')
     parser.add_argument('--perchannel', type=str, nargs='+', default=["k_proj"])
     parser.add_argument('--pertoken', type=str, nargs='+', default=["v_proj"])
     parser.add_argument('--include_sparse', action='store_true')

@@ -59,8 +59,32 @@ def get_outliers_dynamic(w, channel=-1, thresh=0.999, first_few_fp16=-1):
     return outlier_mask
 
 
+def quant_fn_1bit(inp, qchannel=-1, include_sparse=False, outlier_mask=None):
+    """1-bit quantization using mean as threshold."""
+    if include_sparse and outlier_mask is not None:
+        outliers = inp * outlier_mask
+        inp_clean = inp - outliers
+    else:
+        inp_clean = inp
+        outliers = None
+    
+    threshold = torch.mean(inp_clean, dim=qchannel, keepdim=True)
+    maxval = torch.max(inp_clean, dim=qchannel, keepdim=True).values
+    minval = torch.min(inp_clean, dim=qchannel, keepdim=True).values
+    qinp_out = torch.where(inp_clean >= threshold, maxval, minval)
+    
+    if include_sparse and outliers is not None:
+        qinp_out[outlier_mask] = 0
+        qinp_out = qinp_out + outliers
+    
+    return torch.nan_to_num(qinp_out, nan=0.0, posinf=0.0, neginf=0.0)
+
+
 def quant_fn_zp(inp, bits=8, qchannel=-1, dynamicquantization=True,
                 include_sparse=False, outlier_mask=None, clamp=False):
+    if bits == 1:
+        return quant_fn_1bit(inp, qchannel, include_sparse, outlier_mask)
+    
     if dynamicquantization:
         if include_sparse and outlier_mask is not None:
             outliers = inp * outlier_mask
@@ -441,7 +465,8 @@ if __name__ == '__main__':
     parser.add_argument('--max_length', type=int, default=4096)
     
     # Quantization
-    parser.add_argument('--abits', type=int, default=4, choices=[2, 3, 4, 5, 8, 16])
+    parser.add_argument('--abits', type=int, default=4, choices=[1, 2, 3, 4, 5, 8, 16],
+                        help='Bits for quantization. WARNING: 1-bit will have very poor quality!')
     parser.add_argument('--perchannel', type=str, nargs='+', default=["k_proj"])
     parser.add_argument('--pertoken', type=str, nargs='+', default=["v_proj"])
     parser.add_argument('--include_sparse', action='store_true')
