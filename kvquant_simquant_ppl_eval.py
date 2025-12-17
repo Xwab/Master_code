@@ -505,12 +505,20 @@ class QuantLinearSim(nn.Module):
         x = x.reshape(-1, x.shape[-1])
         
         # Weight and bias are registered as buffers, so they move with the model
-        # Compute output
-        x = x.half()
-        y = x @ self.weight
-        if self.bias is not None:
-            y = y + self.bias
-        y = y.float()
+        # Compute output - use half on GPU, float on CPU
+        if x.device.type == 'cuda':
+            x = x.half()
+            y = x @ self.weight
+            if self.bias is not None:
+                y = y + self.bias
+            y = y.float()
+        else:
+            # CPU doesn't support half precision matmul
+            x = x.float()
+            weight_float = self.weight.float()
+            y = x @ weight_float
+            if self.bias is not None:
+                y = y + self.bias.float()
         
         # Detect outliers
         if self.include_sparse:
@@ -558,7 +566,11 @@ class QuantLinearSim(nn.Module):
                 clamp=self.clamp
             )
         
-        return y.reshape(out_shape).half()
+        # Return in appropriate dtype based on device
+        if y.device.type == 'cuda':
+            return y.reshape(out_shape).half()
+        else:
+            return y.reshape(out_shape).float()
 
 
 # ============================================================================
