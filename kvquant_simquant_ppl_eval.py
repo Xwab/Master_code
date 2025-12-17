@@ -509,25 +509,20 @@ class QuantLinearSim(nn.Module):
         self.first_few_fp16 = first_few_fp16
     
     def forward(self, x):
-        # Save original input device and dtype for output
-        input_device = x.device
-        input_dtype = x.dtype
-        
         out_shape = x.shape[:-1] + (self.outfeatures,)
         x = x.reshape(-1, x.shape[-1])
         
-        # Determine compute device - prefer weight's device (should be on GPU if model is on GPU)
-        compute_device = self.weight.device
-        compute_dtype = torch.float32  # Always compute in float32 for stability
+        # Use weight's device as the target device (this is where model lives)
+        # This ensures output is on the same device as other model components
+        target_device = self.weight.device
         
-        # Move input to compute device
-        x = x.to(device=compute_device, dtype=compute_dtype)
-        weight = self.weight.to(dtype=compute_dtype)
+        # Move input to model's device and use float32 for computation
+        x = x.to(device=target_device, dtype=torch.float32)
         
         # Compute linear output
-        y = x @ weight
+        y = x @ self.weight.float()
         if self.bias is not None:
-            y = y + self.bias.to(dtype=compute_dtype)
+            y = y + self.bias.float()
         
         # Detect outliers
         outlier_mask = None
@@ -553,10 +548,13 @@ class QuantLinearSim(nn.Module):
         else:
             y = self._quant_uniform(y, outlier_mask)
         
-        # Return output on the SAME device and dtype as input
+        # Output stays on target_device (same as model's other components)
+        # Use half precision on GPU for consistency with other layers
         y = y.reshape(out_shape)
-        y = y.to(device=input_device, dtype=input_dtype)
-        return y
+        if target_device.type == 'cuda':
+            return y.half()
+        else:
+            return y.float()
     
     def _quant_uniform(self, y, outlier_mask):
         """Uniform quantization with zero-point."""
