@@ -590,7 +590,8 @@ def make_quant_sim(model, quantizers, bits, name='', perchannel=True,
     for attr in dir(model):
         tmp = getattr(model, attr)
         name1 = name + '.' + attr if name != '' else attr
-        if name1 in quantizers.keys():
+        # Only replace nn.Linear layers that are in quantizers
+        if name1 in quantizers.keys() and isinstance(tmp, nn.Linear):
             delattr(model, attr)
             setattr(model, attr, QuantLinearSim(
                 name1, bits, quantizers[name1],
