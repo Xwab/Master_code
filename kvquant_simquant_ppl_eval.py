@@ -128,7 +128,8 @@ def quant_fn_nuq(
     include_sparse=False,
     outlier_mask=None,
     lut=None,
-    first_few_fp16=-1
+    first_few_fp16=-1,
+    recent_fp16=-1
 ):
     """
     Non-Uniform Quantization (NUQ) using lookup table.
@@ -146,14 +147,15 @@ def quant_fn_nuq(
         include_sparse: use sparse quantization
         outlier_mask: outlier positions
         lut: lookup table (centroids)
-        first_few_fp16: keep first N tokens in FP16
+        first_few_fp16: keep first N tokens in FP16 (attention sink)
+        recent_fp16: keep last N tokens in FP16 (KIVI-style)
     """
     if lut is None:
         # Fall back to uniform quantization if no LUT
         return quant_fn_zp(inp, bits, qchannel, dynamicquantization, 
                           include_sparse, outlier_mask)
     
-    orig_inp = inp.clone() if first_few_fp16 > -1 else None
+    orig_inp = inp.clone() if (first_few_fp16 > -1 or recent_fp16 > -1) else None
     
     # Compute range dynamically
     if dynamicquantization:
@@ -201,16 +203,22 @@ def quant_fn_nuq(
     # Shift by offset
     qinp_out = qinp_out + offset
     
-    # Keep first few tokens in FP16
+    # Keep first few tokens in FP16 (attention sink)
     if first_few_fp16 > -1 and orig_inp is not None:
         qinp_out[:first_few_fp16, :] = orig_inp[:first_few_fp16, :]
+    
+    # Keep last few tokens in FP16 (KIVI-style sliding window)
+    if recent_fp16 > -1 and orig_inp is not None and qinp_out.shape[0] > recent_fp16:
+        qinp_out[-recent_fp16:, :] = orig_inp[-recent_fp16:, :]
     
     return torch.nan_to_num(qinp_out, nan=0.0, posinf=0.0, neginf=0.0)
 
 
-def get_outliers_dynamic(w, channel=-1, thresh=0.999, first_few_fp16=-1):
+def get_outliers_dynamic(w, channel=-1, thresh=0.999, first_few_fp16=-1, recent_fp16=-1):
     """
     Dynamically detect outliers (from KVQuant simquant_module_quantizer.py)
+    
+    Extended to support recent_fp16 for KIVI-style sliding window.
     """
     t = 1 - ((1 - thresh) / 2)
     w = w.float()
@@ -226,8 +234,13 @@ def get_outliers_dynamic(w, channel=-1, thresh=0.999, first_few_fp16=-1):
     
     outlier_mask = torch.logical_or(under_lower, above_upper)
     
+    # Attention sink: keep first few tokens in FP16
     if first_few_fp16 > -1:
         outlier_mask[:first_few_fp16, :] = True
+    
+    # KIVI-style: keep last few (recent) tokens in FP16
+    if recent_fp16 > -1 and w.shape[0] > recent_fp16:
+        outlier_mask[-recent_fp16:, :] = True
     
     return outlier_mask
 
@@ -276,12 +289,17 @@ def quant_fn_zp(
     outlier_mask=None,
     maxval=None,
     minval=None,
-    clamp=False
+    clamp=False,
+    first_few_fp16=-1,
+    recent_fp16=-1
 ):
     """
     Integer quantization with zero-point (EXACT copy from KVQuant)
-    Extended to support 1-bit quantization.
+    Extended to support 1-bit quantization and recent_fp16 (KIVI-style).
     """
+    # Save original for first_few_fp16 and recent_fp16
+    orig_inp = inp.clone() if (first_few_fp16 > -1 or recent_fp16 > -1) else None
+    
     # Special handling for 1-bit
     if bits == 1:
         return quant_fn_1bit(inp, qchannel, include_sparse, outlier_mask)
@@ -323,6 +341,14 @@ def quant_fn_zp(
         qinp_out[outlier_mask] = 0
         qinp_out = qinp_out + outliers
     
+    # Keep first few tokens in FP16 (attention sink)
+    if first_few_fp16 > -1 and orig_inp is not None:
+        qinp_out[:first_few_fp16, :] = orig_inp[:first_few_fp16, :]
+    
+    # Keep last few tokens in FP16 (KIVI-style sliding window)
+    if recent_fp16 > -1 and orig_inp is not None and qinp_out.shape[0] > recent_fp16:
+        qinp_out[-recent_fp16:, :] = orig_inp[-recent_fp16:, :]
+    
     qinp_out = torch.nan_to_num(qinp_out, nan=0.0, posinf=0.0, neginf=0.0)
     return qinp_out
 
@@ -334,6 +360,7 @@ def simulated_quantize(
     include_sparse=False,
     sparsity_threshold=0.999,
     first_few_fp16=-1,
+    recent_fp16=-1,
     clamp=False
 ):
     """
@@ -345,7 +372,8 @@ def simulated_quantize(
         qchannel: Quantization channel (0=per-channel, -1=per-token)
         include_sparse: Use dense-and-sparse quantization
         sparsity_threshold: Outlier threshold
-        first_few_fp16: Keep first N tokens in FP16
+        first_few_fp16: Keep first N tokens in FP16 (attention sink)
+        recent_fp16: Keep last N tokens in FP16 (KIVI-style sliding window)
     """
     if bits >= 16:
         return tensor
@@ -360,7 +388,7 @@ def simulated_quantize(
     if include_sparse:
         outlier_mask = get_outliers_dynamic(
             tensor, channel=qchannel, thresh=sparsity_threshold,
-            first_few_fp16=first_few_fp16
+            first_few_fp16=first_few_fp16, recent_fp16=recent_fp16
         )
     else:
         outlier_mask = None
@@ -369,7 +397,8 @@ def simulated_quantize(
     tensor = quant_fn_zp(
         tensor, bits=bits, qchannel=qchannel,
         include_sparse=include_sparse, outlier_mask=outlier_mask,
-        dynamicquantization=True, clamp=clamp
+        dynamicquantization=True, clamp=clamp,
+        first_few_fp16=first_few_fp16, recent_fp16=recent_fp16
     )
     
     return tensor.reshape(orig_shape).to(orig_dtype)
@@ -401,6 +430,7 @@ class QuantLinearSim(nn.Module):
         include_sparse=False,
         sparsity_threshold=0.999,
         first_few_fp16=-1,
+        recent_fp16=-1,
         clamp=False,
         nuq=False,
         lut=None
@@ -421,6 +451,7 @@ class QuantLinearSim(nn.Module):
         self.include_sparse = include_sparse
         self.sparsity_threshold = sparsity_threshold
         self.first_few_fp16 = first_few_fp16
+        self.recent_fp16 = recent_fp16
         self.clamp = clamp
         
         # NUQ settings
@@ -477,7 +508,7 @@ class QuantLinearSim(nn.Module):
         if self.include_sparse:
             outlier_mask = get_outliers_dynamic(
                 y, channel=self.qchannel, thresh=self.sparsity_threshold,
-                first_few_fp16=self.first_few_fp16
+                first_few_fp16=self.first_few_fp16, recent_fp16=self.recent_fp16
             )
         else:
             outlier_mask = None
@@ -488,13 +519,14 @@ class QuantLinearSim(nn.Module):
                 y, bits=self.bits, qchannel=self.qchannel,
                 include_sparse=self.include_sparse, outlier_mask=outlier_mask,
                 dynamicquantization=True, lut=self.lut,
-                first_few_fp16=self.first_few_fp16
+                first_few_fp16=self.first_few_fp16, recent_fp16=self.recent_fp16
             )
         else:
             y = quant_fn_zp(
                 y, bits=self.bits, qchannel=self.qchannel,
                 include_sparse=self.include_sparse, outlier_mask=outlier_mask,
-                dynamicquantization=True, clamp=self.clamp
+                dynamicquantization=True, clamp=self.clamp,
+                first_few_fp16=self.first_few_fp16, recent_fp16=self.recent_fp16
             )
         
         return y.reshape(out_shape).half()
@@ -517,7 +549,7 @@ class PreRoPEQuantAttention(nn.Module):
     """
     
     def __init__(self, original_attn, bits, include_sparse=False, 
-                 sparsity_threshold=0.999, first_few_fp16=-1, clamp=False):
+                 sparsity_threshold=0.999, first_few_fp16=-1, recent_fp16=-1, clamp=False):
         super().__init__()
         
         # Copy all attributes from original attention
@@ -545,6 +577,7 @@ class PreRoPEQuantAttention(nn.Module):
         self.include_sparse = include_sparse
         self.sparsity_threshold = sparsity_threshold
         self.first_few_fp16 = first_few_fp16
+        self.recent_fp16 = recent_fp16
         self.clamp = clamp
     
     def forward(
@@ -580,6 +613,7 @@ class PreRoPEQuantAttention(nn.Module):
             include_sparse=self.include_sparse,
             sparsity_threshold=self.sparsity_threshold,
             first_few_fp16=self.first_few_fp16,
+            recent_fp16=self.recent_fp16,
             clamp=self.clamp
         )
         key_states = key_states_flat.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -591,6 +625,7 @@ class PreRoPEQuantAttention(nn.Module):
             include_sparse=self.include_sparse,
             sparsity_threshold=self.sparsity_threshold,
             first_few_fp16=self.first_few_fp16,
+            recent_fp16=self.recent_fp16,
             clamp=self.clamp
         )
         value_states = value_states_flat.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -638,7 +673,7 @@ class PreRoPEQuantAttention(nn.Module):
 
 def make_quant_sim(model, bits, perchannel_match=["k_proj"], pertoken_match=["v_proj"],
                    include_sparse=False, sparsity_threshold=0.999, first_few_fp16=-1, 
-                   clamp=False, nuq=False):
+                   recent_fp16=-1, clamp=False, nuq=False):
     """
     Replace k_proj/v_proj with QuantLinearSim (simquant mode).
     
@@ -649,7 +684,8 @@ def make_quant_sim(model, bits, perchannel_match=["k_proj"], pertoken_match=["v_
         pertoken_match: layers to use per-token quantization
         include_sparse: use dense-and-sparse quantization
         sparsity_threshold: outlier threshold
-        first_few_fp16: attention sink tokens
+        first_few_fp16: attention sink tokens (KVQuant style)
+        recent_fp16: recent tokens in FP16 (KIVI style)
         clamp: clamp zero-point
         nuq: use Non-Uniform Quantization (K-means based LUT)
     """
@@ -671,7 +707,7 @@ def make_quant_sim(model, bits, perchannel_match=["k_proj"], pertoken_match=["v_
                 outfeatures=module.out_features, weight=module.weight, bias=module.bias,
                 perchannel=is_perchannel, include_sparse=include_sparse,
                 sparsity_threshold=sparsity_threshold, first_few_fp16=first_few_fp16, 
-                clamp=clamp, nuq=nuq
+                recent_fp16=recent_fp16, clamp=clamp, nuq=nuq
             )
             
             setattr(parent, attr_name, quant_layer)
@@ -683,7 +719,7 @@ def make_quant_sim(model, bits, perchannel_match=["k_proj"], pertoken_match=["v_
 
 
 def make_pre_rope_quant(model, bits, include_sparse=False, sparsity_threshold=0.999,
-                        first_few_fp16=-1, clamp=False):
+                        first_few_fp16=-1, recent_fp16=-1, clamp=False):
     """Replace attention modules with PreRoPEQuantAttention (true pre-RoPE mode)."""
     replaced = 0
     
@@ -698,7 +734,7 @@ def make_pre_rope_quant(model, bits, include_sparse=False, sparsity_threshold=0.
             quant_attn = PreRoPEQuantAttention(
                 module, bits, include_sparse=include_sparse,
                 sparsity_threshold=sparsity_threshold,
-                first_few_fp16=first_few_fp16, clamp=clamp
+                first_few_fp16=first_few_fp16, recent_fp16=recent_fp16, clamp=clamp
             )
             
             setattr(parent, attr_name, quant_attn)
@@ -845,6 +881,8 @@ if __name__ == '__main__':
                         help='Percentile for outlier detection (e.g., 0.99 = 1%% outliers)')
     parser.add_argument('--first_few_fp16', type=int, default=-1,
                         help='Keep first N tokens in FP16 (attention sink)')
+    parser.add_argument('--recent_fp16', type=int, default=-1,
+                        help='Keep last N tokens in FP16 (like KIVI sliding window)')
     parser.add_argument('--clamp', action='store_true',
                         help='Clamp zero-point in integer quantization')
     parser.add_argument('--nuq', action='store_true',
@@ -881,6 +919,8 @@ if __name__ == '__main__':
         logger.info(f"Sparse: {(1-args.sparsity_threshold)*100:.1f}% outliers in FP16")
     if args.first_few_fp16 > 0:
         logger.info(f"Attention sink: first {args.first_few_fp16} tokens in FP16")
+    if args.recent_fp16 > 0:
+        logger.info(f"Sliding window (KIVI-style): last {args.recent_fp16} tokens in FP16")
     logger.info("=" * 60)
     
     # Load model
@@ -896,7 +936,7 @@ if __name__ == '__main__':
             logger.info("Applying TRUE pre-RoPE quantization...")
             model = make_pre_rope_quant(
                 model, args.abits, args.include_sparse,
-                args.sparsity_threshold, args.first_few_fp16, args.clamp
+                args.sparsity_threshold, args.first_few_fp16, args.recent_fp16, args.clamp
             )
         else:
             quant_type = "NUQ" if args.nuq else "uniform"
@@ -904,7 +944,7 @@ if __name__ == '__main__':
             model = make_quant_sim(
                 model, args.abits, args.perchannel, args.pertoken,
                 args.include_sparse, args.sparsity_threshold,
-                args.first_few_fp16, args.clamp, args.nuq
+                args.first_few_fp16, args.recent_fp16, args.clamp, args.nuq
             )
     
     model = model.half()
