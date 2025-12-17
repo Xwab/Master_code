@@ -429,7 +429,6 @@ class QuantLinearSim(nn.Module):
     """
     Simulated quantization for K/V projection layers.
     Uses calibrated parameters for static quantization.
-    EXACT copy from KVQuant.
     """
     
     def __init__(self, name, bits, quantizer, infeatures, outfeatures,
@@ -447,11 +446,11 @@ class QuantLinearSim(nn.Module):
         
         # Store weight transposed for x @ weight computation
         # Use register_buffer so weight moves with .to(device)
-        self.register_buffer('weight', weight.T.detach().clone())
+        self.register_buffer('weight', weight.T.detach().clone().float())
         if bias is not None:
-            self.register_buffer('bias', bias.detach().clone())
+            self.register_buffer('bias', bias.detach().clone().float())
         else:
-            self.bias = None
+            self.register_buffer('bias', None)
         
         # Add a dummy parameter so that self.parameters() is not empty
         # This fixes: next(self.self_attn.parameters()).device in transformers
@@ -467,35 +466,44 @@ class QuantLinearSim(nn.Module):
         self.include_sparse = include_sparse
         self.sparsity_threshold = sparsity_threshold
         
-        # Load calibrated thresholds
+        # Load calibrated thresholds - register as buffers for device consistency
         if quantizer is not None:
-            self.outlier_threshold_upper = torch.tensor(quantizer[0]).flatten().half()
-            self.outlier_threshold_lower = torch.tensor(quantizer[1]).flatten().half()
+            self.register_buffer('outlier_threshold_upper', 
+                                 torch.tensor(quantizer[0]).flatten().float())
+            self.register_buffer('outlier_threshold_lower', 
+                                 torch.tensor(quantizer[1]).flatten().float())
             
-            # NUQ LUT
+            # NUQ LUT - store as buffer
             self.nuq = nuq
             if nuq and quantizer[2] is not None:
-                self.lut = quantizer[2]
+                lut_tensor = torch.tensor(quantizer[2][0]).flatten().float()
+                self.register_buffer('lut', lut_tensor)
             else:
-                self.lut = None
+                self.register_buffer('lut', None)
             
-            # Q-Norm
+            # Q-Norm - store as buffers
             self.norm = norm
             if norm and len(quantizer) > 3 and quantizer[3] is not None:
-                self.normscale = quantizer[3]
-                self.normoffset = quantizer[4]
+                if isinstance(quantizer[3], torch.Tensor):
+                    self.register_buffer('normscale', quantizer[3].float())
+                else:
+                    self.register_buffer('normscale', torch.tensor(quantizer[3]).float())
+                if isinstance(quantizer[4], torch.Tensor):
+                    self.register_buffer('normoffset', quantizer[4].float())
+                else:
+                    self.register_buffer('normoffset', torch.tensor(quantizer[4]).float())
             else:
-                self.normscale = None
-                self.normoffset = None
+                self.register_buffer('normscale', None)
+                self.register_buffer('normoffset', None)
         else:
             # Dynamic mode - no calibrated parameters
-            self.outlier_threshold_upper = None
-            self.outlier_threshold_lower = None
+            self.register_buffer('outlier_threshold_upper', None)
+            self.register_buffer('outlier_threshold_lower', None)
             self.nuq = nuq
-            self.lut = None
+            self.register_buffer('lut', None)
             self.norm = norm
-            self.normscale = None
-            self.normoffset = None
+            self.register_buffer('normscale', None)
+            self.register_buffer('normoffset', None)
         
         self.cap_outliers = cap_outliers
         self.first_few_fp16 = first_few_fp16
@@ -506,25 +514,19 @@ class QuantLinearSim(nn.Module):
         
         # Determine target device - prefer weight's device (should be on GPU if model is on GPU)
         target_device = self.weight.device
+        target_dtype = torch.float32  # Always compute in float32 for stability
         
         # Move input to the same device as weight
-        x = x.to(target_device)
+        x = x.to(device=target_device, dtype=target_dtype)
+        weight = self.weight.to(dtype=target_dtype)
         
-        # Compute output - use half on GPU, float on CPU
-        if target_device.type == 'cuda':
-            x = x.half()
-            y = x @ self.weight.half()
-            if self.bias is not None:
-                y = y + self.bias.half()
-            y = y.float()
-        else:
-            # CPU doesn't support half precision matmul
-            x = x.float()
-            y = x @ self.weight.float()
-            if self.bias is not None:
-                y = y + self.bias.float()
+        # Compute linear output
+        y = x @ weight
+        if self.bias is not None:
+            y = y + self.bias.to(dtype=target_dtype)
         
         # Detect outliers
+        outlier_mask = None
         if self.include_sparse:
             if self.dynamicquantization:
                 outlier_mask = get_outliers_dynamic(
@@ -532,49 +534,142 @@ class QuantLinearSim(nn.Module):
                     first_few_fp16=self.first_few_fp16
                 )
             else:
-                self.outlier_threshold_upper = self.outlier_threshold_upper.to(y.device)
-                self.outlier_threshold_lower = self.outlier_threshold_lower.to(y.device)
-                outlier_mask = get_outliers(
-                    y, channel=self.ochannel,
-                    outlier_threshold_upper=self.outlier_threshold_upper,
-                    outlier_threshold_lower=self.outlier_threshold_lower,
-                    cap_outliers=self.cap_outliers,
-                    first_few_fp16=self.first_few_fp16
-                )
-        else:
-            outlier_mask = None
+                if self.outlier_threshold_upper is not None:
+                    outlier_mask = get_outliers(
+                        y, channel=self.ochannel,
+                        outlier_threshold_upper=self.outlier_threshold_upper,
+                        outlier_threshold_lower=self.outlier_threshold_lower,
+                        cap_outliers=self.cap_outliers,
+                        first_few_fp16=self.first_few_fp16
+                    )
         
         # Quantize
         if self.nuq and self.lut is not None:
-            y = quant_fn_nuq_recon(
-                y, bits=self.bits, qchannel=self.qchannel,
-                maxval=self.outlier_threshold_upper,
-                minval=self.outlier_threshold_lower,
-                include_sparse=self.include_sparse,
-                outlier_mask=outlier_mask,
-                dynamicquantization=self.dynamicquantization,
-                lut=self.lut,
-                norm=self.norm,
-                normscale=self.normscale,
-                normoffset=self.normoffset,
-                first_few_fp16=self.first_few_fp16
-            )
+            y = self._quant_nuq(y, outlier_mask)
         else:
-            y = quant_fn_zp(
-                y, bits=self.bits, qchannel=self.qchannel,
-                maxval=self.outlier_threshold_upper if not self.dynamicquantization else -1,
-                minval=self.outlier_threshold_lower if not self.dynamicquantization else -1,
-                include_sparse=self.include_sparse,
-                outlier_mask=outlier_mask,
-                dynamicquantization=self.dynamicquantization,
-                clamp=self.clamp
-            )
+            y = self._quant_uniform(y, outlier_mask)
         
-        # Return in appropriate dtype based on device
+        # Return in appropriate dtype
         if target_device.type == 'cuda':
             return y.reshape(out_shape).half()
         else:
             return y.reshape(out_shape).float()
+    
+    def _quant_uniform(self, y, outlier_mask):
+        """Uniform quantization with zero-point."""
+        device = y.device
+        
+        if self.dynamicquantization:
+            # Dynamic: compute min/max from current batch
+            if self.include_sparse and outlier_mask is not None:
+                outliers = y * outlier_mask
+                median = torch.median(y, dim=self.qchannel).values.unsqueeze(self.qchannel)
+                median_mask = median * outlier_mask
+                tmp_y = y - outliers + median_mask
+                maxval = torch.max(tmp_y, dim=self.qchannel).values
+                minval = torch.min(tmp_y, dim=self.qchannel).values
+            else:
+                maxval = torch.max(y, dim=self.qchannel).values
+                minval = torch.min(y, dim=self.qchannel).values
+        else:
+            # Static: use calibrated thresholds
+            maxval = self.outlier_threshold_upper
+            minval = self.outlier_threshold_lower
+        
+        # Compute scale and offset
+        rangeval = maxval - minval
+        qx = (2**self.bits - 1) / rangeval.clamp(min=1e-8)
+        
+        if self.clamp:
+            offset = torch.round(minval * qx).clamp(-(2**self.bits - 1), 0)
+        else:
+            offset = minval * qx
+        
+        offset = offset.unsqueeze(self.qchannel)
+        qx = qx.unsqueeze(self.qchannel)
+        
+        # Handle outliers
+        if self.include_sparse and outlier_mask is not None:
+            outliers = y * outlier_mask
+            y = y - outliers
+        
+        # Quantize and dequantize
+        qy = torch.round(qx * y - offset)
+        qy = torch.clip(qy, min=0, max=2**self.bits - 1)
+        y_out = (qy + offset) / qx
+        
+        # Add outliers back
+        if self.include_sparse and outlier_mask is not None:
+            y_out[outlier_mask] = 0
+            y_out = y_out + outliers
+        
+        return torch.nan_to_num(y_out, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    def _quant_nuq(self, y, outlier_mask):
+        """Non-uniform quantization using LUT."""
+        device = y.device
+        
+        if self.first_few_fp16 > -1:
+            orig = y.clone()
+        
+        if self.dynamicquantization:
+            if self.include_sparse and outlier_mask is not None:
+                outliers = y * outlier_mask
+                median = torch.median(y, dim=self.qchannel).values.unsqueeze(self.qchannel)
+                median_mask = median * outlier_mask
+                tmp_y = y - outliers + median_mask
+                maxval = torch.max(tmp_y, dim=self.qchannel).values
+                minval = torch.min(tmp_y, dim=self.qchannel).values
+            else:
+                maxval = torch.max(y, dim=self.qchannel).values
+                minval = torch.min(y, dim=self.qchannel).values
+        else:
+            maxval = self.outlier_threshold_upper
+            minval = self.outlier_threshold_lower
+        
+        # Compute offset and range
+        offset = (maxval + minval) / 2
+        rangeval = (maxval - minval) / 2
+        offset = offset.unsqueeze(self.qchannel)
+        rangeval = rangeval.unsqueeze(self.qchannel)
+        
+        # Shift by offset
+        y = y - offset
+        
+        # Handle outliers
+        if self.include_sparse and outlier_mask is not None:
+            outliers = y * outlier_mask
+            y = y - outliers
+        
+        # Normalize to [-1, 1]
+        y_scaled = y / rangeval.clamp(min=1e-8)
+        
+        # Round to nearest LUT entry
+        lut = self.lut  # Already on correct device via register_buffer
+        q_out = round_to_nearest_pole_sim(y_scaled.flatten(), lut)
+        q_out = q_out.reshape(y.shape)
+        
+        # Q-Norm
+        if self.norm and self.normscale is not None and self.normoffset is not None:
+            q_out = q_out * self.normscale + self.normoffset
+        
+        # De-normalize
+        q_out = q_out * rangeval
+        
+        # Add outliers back
+        if self.include_sparse and outlier_mask is not None:
+            q_out[outlier_mask] = 0
+            q_out = q_out + outliers
+        
+        # Shift by offset
+        q_out = q_out + offset
+        q_out = torch.nan_to_num(q_out, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Keep first few in FP16
+        if self.first_few_fp16 > -1:
+            q_out[:self.first_few_fp16, :] = orig[:self.first_few_fp16, :]
+        
+        return q_out
 
 
 # ============================================================================
