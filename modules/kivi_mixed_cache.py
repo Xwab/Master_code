@@ -360,6 +360,8 @@ class KIVIMixedPrecisionCache(Cache):
     Key: Uses standard KIVI per-channel quantization (k_bits)
     Value: Uses mixed 4bit/2bit quantization based on singular value importance
     
+    Supports per-layer different ranks for Value quantization.
+    
     Compatible with model.generate()
     """
     
@@ -367,30 +369,42 @@ class KIVIMixedPrecisionCache(Cache):
         self,
         k_bits: int = 2,
         out_features: int = 4096,
-        original_rank: int = 256,
+        layer_original_ranks: Dict[int, int] = None,  # Per-layer ranks
+        default_original_rank: int = 256,  # Fallback if layer not in dict
         group_size: int = 128,
         residual_length: int = 128,
     ):
         super().__init__()
         self.k_bits = k_bits
         self.out_features = out_features
-        self.original_rank = original_rank
+        self.layer_original_ranks = layer_original_ranks or {}
+        self.default_original_rank = default_original_rank
         self.group_size = group_size
         self.residual_length = residual_length
         
-        # Key quantizer (standard KIVI per-channel)
+        # Key quantizer (standard KIVI per-channel) - same for all layers
         self.key_quantizer = KIVIKeyQuantizer(n_bits=k_bits, group_size=group_size)
         
-        # Value quantizer (mixed-precision)
-        self.value_quantizer = KIVIMixedPrecisionQuantizer(
-            out_features=out_features,
-            original_rank=original_rank,
-            group_size=group_size,
-        )
+        # Per-layer Value quantizers (created lazily)
+        self._value_quantizers: Dict[int, KIVIMixedPrecisionQuantizer] = {}
         
         # Cache storage
         self._cache: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         self._seen_tokens = 0
+    
+    def _get_value_quantizer(self, layer_idx: int) -> KIVIMixedPrecisionQuantizer:
+        """Get or create a value quantizer for the given layer."""
+        if layer_idx not in self._value_quantizers:
+            # Get the original_rank for this layer
+            original_rank = self.layer_original_ranks.get(layer_idx, self.default_original_rank)
+            
+            self._value_quantizers[layer_idx] = KIVIMixedPrecisionQuantizer(
+                out_features=self.out_features,
+                original_rank=original_rank,
+                group_size=self.group_size,
+            )
+        
+        return self._value_quantizers[layer_idx]
     
     def __len__(self) -> int:
         return len(self._cache)
@@ -452,8 +466,9 @@ class KIVIMixedPrecisionCache(Cache):
                 
                 # Key: standard KIVI quantization
                 key_quant = self.key_quantizer(key_to_quant)
-                # Value: mixed-precision quantization
-                value_quant = self.value_quantizer(value_to_quant)
+                # Value: mixed-precision quantization (per-layer)
+                value_quantizer = self._get_value_quantizer(layer_idx)
+                value_quant = value_quantizer(value_to_quant)
                 
                 self._cache[layer_idx] = (key_quant, key_res, value_quant, value_res)
                 
@@ -486,7 +501,9 @@ class KIVIMixedPrecisionCache(Cache):
                     value_to_move = value_res[:, :n_to_move, :]
                     
                     key_move_quant = self.key_quantizer(key_to_move)
-                    value_move_quant = self.value_quantizer(value_to_move)
+                    # Value: mixed-precision quantization (per-layer)
+                    value_quantizer = self._get_value_quantizer(layer_idx)
+                    value_move_quant = value_quantizer(value_to_move)
                     
                     if key_quant is not None:
                         key_quant = torch.cat([key_quant, key_move_quant], dim=1)
@@ -534,14 +551,24 @@ class KIVIMixedPrecisionCache(Cache):
             return {"status": "no layer 0"}
         
         k_q, k_r, v_q, v_r = layer_0
+        
+        # Collect per-layer value quantizer info
+        per_layer_info = {}
+        for layer_idx, quantizer in self._value_quantizers.items():
+            per_layer_info[layer_idx] = {
+                "original_rank": quantizer.original_rank,
+                "n_4bit": quantizer.n_4bit,
+                "n_2bit": quantizer.n_2bit,
+            }
+        
         return {
             "num_layers": len(self._cache),
             "total_seq_len": self.get_seq_length(0),
             "quantized_len": k_q.shape[1] if k_q is not None else 0,
             "residual_len": k_r.shape[1] if k_r is not None else 0,
             "k_bits": self.k_bits,
-            "value_n_4bit": self.value_quantizer.n_4bit,
-            "value_n_2bit": self.value_quantizer.n_2bit,
+            "per_layer_value_quant": per_layer_info,
+            "layer_original_ranks": self.layer_original_ranks,
         }
 
 
@@ -605,15 +632,32 @@ class KIVIKeyQuantizer(nn.Module):
 def create_mixed_precision_cache(
     k_bits: int = 2,
     out_features: int = 4096,
-    original_rank: int = 256,
+    layer_original_ranks: Dict[int, int] = None,
+    default_original_rank: int = 256,
     group_size: int = 128,
     residual_length: int = 128,
 ) -> KIVIMixedPrecisionCache:
-    """Create a mixed-precision KIVI cache."""
+    """
+    Create a mixed-precision KIVI cache with per-layer rank support.
+    
+    Args:
+        k_bits: Number of bits for Key quantization (per-channel)
+        out_features: Output dimension D (typically num_kv_heads * head_dim)
+        layer_original_ranks: Dict mapping layer_idx -> original_rank for that layer
+            e.g., {0: 256, 1: 384, 2: 512, ...}
+            This is used to calculate the 4bit/2bit split for each layer
+        default_original_rank: Fallback rank if layer not in layer_original_ranks
+        group_size: Group size for quantization
+        residual_length: Number of recent tokens to keep in full precision
+    
+    Returns:
+        KIVIMixedPrecisionCache configured with per-layer ranks
+    """
     return KIVIMixedPrecisionCache(
         k_bits=k_bits,
         out_features=out_features,
-        original_rank=original_rank,
+        layer_original_ranks=layer_original_ranks,
+        default_original_rank=default_original_rank,
         group_size=group_size,
         residual_length=residual_length,
     )

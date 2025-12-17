@@ -1544,7 +1544,6 @@ class ALRDLlamaForCausalLM(LlamaForCausalLM):
     def create_mixed_precision_cache(
         self,
         out_features: int = None,
-        original_rank: int = None,
     ) -> KIVIMixedPrecisionCache:
         """
         Create a mixed-precision KIVI cache for full-rank Value quantization.
@@ -1552,32 +1551,49 @@ class ALRDLlamaForCausalLM(LlamaForCausalLM):
         This cache uses:
         - Standard KIVI per-channel quantization for Key
         - Mixed 4bit/2bit quantization for Value based on singular value importance
+        - Per-layer different ranks from truncation_ranks
         
         Args:
             out_features: Output dimension (D). If None, uses head_dim * num_kv_heads
-            original_rank: The rank that would have been used with 3bit quantization.
-                If None, tries to extract from first layer's v_proj
         
         Returns:
-            KIVIMixedPrecisionCache configured for this model
+            KIVIMixedPrecisionCache configured for this model with per-layer ranks
         """
-        # Try to get parameters from model
+        # Get out_features from model config
         if out_features is None:
             out_features = self.config.hidden_size // self.config.num_attention_heads * self.config.num_key_value_heads
         
-        if original_rank is None:
-            # Try to get from first v_proj layer
-            for name, rank in self.truncation_ranks.items():
-                if 'v_proj' in name:
-                    original_rank = rank
-                    break
-            if original_rank is None:
-                original_rank = out_features // 4  # Default to 25% of features
+        # Extract per-layer v_proj ranks from truncation_ranks
+        # truncation_ranks format: {"model.layers.0.self_attn.v_proj": 256, ...}
+        layer_original_ranks = {}
+        default_original_rank = out_features // 4  # Default to 25%
+        
+        for name, rank in self.truncation_ranks.items():
+            if 'v_proj' in name:
+                # Extract layer index from name like "model.layers.0.self_attn.v_proj"
+                try:
+                    parts = name.split('.')
+                    for i, part in enumerate(parts):
+                        if part == 'layers' and i + 1 < len(parts):
+                            layer_idx = int(parts[i + 1])
+                            layer_original_ranks[layer_idx] = rank
+                            break
+                except (ValueError, IndexError):
+                    pass
+        
+        if layer_original_ranks:
+            # Use the first layer's rank as default if available
+            default_original_rank = list(layer_original_ranks.values())[0]
+            print(f"[KIVI MixedPrecision] Created cache with {len(layer_original_ranks)} layer-specific ranks")
+            print(f"[KIVI MixedPrecision] Sample ranks: {dict(list(layer_original_ranks.items())[:3])}...")
+        else:
+            print(f"[KIVI MixedPrecision] No v_proj ranks found, using default_original_rank={default_original_rank}")
         
         return create_mixed_precision_cache(
             k_bits=self.k_bits,
             out_features=out_features,
-            original_rank=original_rank,
+            layer_original_ranks=layer_original_ranks,
+            default_original_rank=default_original_rank,
             group_size=self.group_size,
             residual_length=self.residual_length,
         )
