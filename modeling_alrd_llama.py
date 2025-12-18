@@ -27,9 +27,17 @@ from modules.kivi_mixed_cache import (
     create_mixed_precision_cache,
     calculate_mixed_precision_split,
 )
+from modules.kivi_mixed_cache_v2 import (
+    KIVIKeyQuantizerV2,
+    KIVIMixedValueQuantizerV2,
+    ALRDLinear_KIVI_Value_FullRank_MixedV2,
+    KIVIMixedPrecisionCacheV2,
+    create_mixed_precision_cache_v2,
+    calculate_mixed_precision_split_v2,
+)
 
 # Union type for all KIVI-style caches
-KIVI_CACHE_TYPES = (KIVILatentCache, KIVIMixedPrecisionCache)
+KIVI_CACHE_TYPES = (KIVILatentCache, KIVIMixedPrecisionCache, KIVIMixedPrecisionCacheV2)
 logger = logging.get_logger(__name__)
 
 
@@ -1608,6 +1616,69 @@ class ALRDLlamaForCausalLM(LlamaForCausalLM):
             low_bits=low_bits,
         )
     
+    def create_mixed_precision_cache_v2(
+        self,
+        out_features: int = None,
+    ) -> KIVIMixedPrecisionCacheV2:
+        """
+        Create a mixed-precision KIVI cache V2.
+        
+        V2 uses:
+        - Key: 5bit per-channel quantization (configurable via mixed_v2_k_bits)
+        - Value: 6bit/4bit mixed per-token quantization
+        
+        Args:
+            out_features: Output dimension (D). If None, uses head_dim * num_kv_heads
+        
+        Returns:
+            KIVIMixedPrecisionCacheV2 configured for this model
+        """
+        # Get out_features from model config
+        if out_features is None:
+            out_features = self.config.hidden_size // self.config.num_attention_heads * self.config.num_key_value_heads
+        
+        # Extract per-layer v_proj ranks from truncation_ranks
+        layer_original_ranks = {}
+        default_original_rank = out_features // 4
+        
+        for name, rank in self.truncation_ranks.items():
+            if 'v_proj' in name:
+                try:
+                    parts = name.split('.')
+                    for i, part in enumerate(parts):
+                        if part == 'layers' and i + 1 < len(parts):
+                            layer_idx = int(parts[i + 1])
+                            layer_original_ranks[layer_idx] = rank
+                            break
+                except (ValueError, IndexError):
+                    pass
+        
+        if layer_original_ranks:
+            default_original_rank = list(layer_original_ranks.values())[0]
+            print(f"[KIVI V2] Created cache with {len(layer_original_ranks)} layer-specific ranks")
+        
+        # Get V2 options from config
+        k_bits = getattr(self.config, 'mixed_v2_k_bits', 5)
+        original_avg_bits = getattr(self.config, 'mixed_v2_original_avg_bits', 5.0)
+        high_bits = getattr(self.config, 'mixed_v2_high_bits', 6)
+        low_bits = getattr(self.config, 'mixed_v2_low_bits', 4)
+        match_compression = getattr(self.config, 'mixed_match_compression', True)
+        high_precision_ratio = getattr(self.config, 'mixed_high_precision_ratio', 0.25)
+        
+        return create_mixed_precision_cache_v2(
+            k_bits=k_bits,
+            out_features=out_features,
+            layer_original_ranks=layer_original_ranks,
+            default_original_rank=default_original_rank,
+            group_size=self.group_size,
+            residual_length=self.residual_length,
+            match_compression=match_compression,
+            original_avg_bits=original_avg_bits,
+            high_precision_ratio=high_precision_ratio,
+            high_bits=high_bits,
+            low_bits=low_bits,
+        )
+    
     def generate(
         self,
         inputs=None,
@@ -1642,11 +1713,19 @@ class ALRDLlamaForCausalLM(LlamaForCausalLM):
         
         if use_kivi_cache and self.use_kivi:
             if kwargs.get('past_key_values') is None or not isinstance(kwargs.get('past_key_values'), KIVI_CACHE_TYPES):
-                # Use mixed precision cache if full-rank mixed mode is enabled
-                if self.use_fullrank_mixed_value:
+                # Determine which cache type to use
+                use_mixed_v2 = getattr(self.config, 'use_mixed_v2', False)
+                
+                if use_mixed_v2:
+                    # V2: Key 5bit, Value 6bit/4bit
+                    kwargs['past_key_values'] = self.create_mixed_precision_cache_v2()
+                    print(f"[KIVI] Auto-created KIVIMixedPrecisionCacheV2 for generate()")
+                elif self.use_fullrank_mixed_value:
+                    # V1: Key 2bit, Value 4bit/2bit
                     kwargs['past_key_values'] = self.create_mixed_precision_cache()
                     print(f"[KIVI] Auto-created KIVIMixedPrecisionCache for generate()")
                 else:
+                    # Standard KIVI
                     kwargs['past_key_values'] = self.create_kivi_cache()
                     print(f"[KIVI] Auto-created KIVILatentCache for generate()")
             
@@ -1700,8 +1779,12 @@ class ALRDLlamaForCausalLM(LlamaForCausalLM):
         
         if use_kivi_cache and self.use_kivi and use_cache_flag:
             if past_key_values is None or not isinstance(past_key_values, KIVI_CACHE_TYPES):
-                # Use mixed precision cache if full-rank mixed mode is enabled
-                if self.use_fullrank_mixed_value:
+                # Determine which cache type to use
+                use_mixed_v2 = getattr(self.config, 'use_mixed_v2', False)
+                
+                if use_mixed_v2:
+                    past_key_values = self.create_mixed_precision_cache_v2()
+                elif self.use_fullrank_mixed_value:
                     past_key_values = self.create_mixed_precision_cache()
                 else:
                     past_key_values = self.create_kivi_cache()
