@@ -104,11 +104,18 @@ def run_quant_dequant_timing():
         (2048, 1024, "Large: 2048x1024"),
         (2048, 4096, "Large: 2048x4096"),
         (4096, 4096, "XL: 4096x4096"),
+        # Very long sequences
+        (8192, 1024, "8K seq: 8192x1024"),
+        (16384, 1024, "16K seq: 16384x1024"),
+        (24576, 1024, "24K seq: 24576x1024"),
         # Value reconstruction specific
         (1, 256, "V latent decode: 1x256"),
         (128, 256, "V latent small: 128x256"),
         (512, 256, "V latent med: 512x256"),
         (2048, 256, "V latent long: 2048x256"),
+        (8192, 256, "V latent 8K: 8192x256"),
+        (16384, 256, "V latent 16K: 16384x256"),
+        (24576, 256, "V latent 24K: 24576x256"),
     ]
     
     print(f"\n{'Config':<30} {'Quant (ms)':<12} {'Dequant (ms)':<12} {'Total Q+D':<12} {'Elements':<12}")
@@ -163,9 +170,16 @@ def run_quant_dequant_timing_torch():
         (512, 1024, "Medium: 512x1024"),
         (2048, 1024, "Large: 2048x1024"),
         (4096, 4096, "XL: 4096x4096"),
+        # Very long sequences
+        (8192, 1024, "8K seq: 8192x1024"),
+        (16384, 1024, "16K seq: 16384x1024"),
+        (24576, 1024, "24K seq: 24576x1024"),
         (128, 256, "V latent: 128x256"),
         (512, 256, "V latent: 512x256"),
         (2048, 256, "V latent: 2048x256"),
+        (8192, 256, "V latent 8K: 8192x256"),
+        (16384, 256, "V latent 16K: 16384x256"),
+        (24576, 256, "V latent 24K: 24576x256"),
     ]
     
     print(f"\n{'Config':<30} {'Quant (ms)':<12} {'Dequant (ms)':<12} {'Total Q+D':<12}")
@@ -222,6 +236,14 @@ def run_end_to_end_breakdown():
         (512, 1024, 1024, "Medium: 512x1024 @ 1024x1024"),
         (2048, 1024, 1024, "Large: 2048x1024 @ 1024x1024"),
         (2048, 4096, 4096, "XL: 2048x4096 @ 4096x4096"),
+        # Very long sequences (8K, 16K, 24K)
+        (8192, 1024, 1024, "8K seq: 8192x1024 @ 1024x1024"),
+        (16384, 1024, 1024, "16K seq: 16384x1024 @ 1024x1024"),
+        (24576, 1024, 1024, "24K seq: 24576x1024 @ 1024x1024"),
+        # V recon for very long sequences
+        (8192, 256, 1024, "V recon 8K: 8192x256 @ 256x1024"),
+        (16384, 256, 1024, "V recon 16K: 16384x256 @ 256x1024"),
+        (24576, 256, 1024, "V recon 24K: 24576x256 @ 256x1024"),
     ]
     
     print(f"\n{'Config':<35} {'FP16':<8} {'Q(A)':<8} {'Q(B)':<8} {'Compute':<8} {'Total INT8':<10} {'Speedup':<8}")
@@ -298,6 +320,14 @@ def run_bnb_linear_breakdown():
         (2048, 256, 1024, "V recon long"),
         (512, 1024, 1024, "Medium"),
         (2048, 4096, 4096, "XL"),
+        # Very long sequences (8K, 16K, 24K)
+        (8192, 1024, 1024, "8K: 8192x1024->1024"),
+        (16384, 1024, 1024, "16K: 16384x1024->1024"),
+        (24576, 1024, 1024, "24K: 24576x1024->1024"),
+        # V recon for very long sequences
+        (8192, 256, 1024, "V recon 8K"),
+        (16384, 256, 1024, "V recon 16K"),
+        (24576, 256, 1024, "V recon 24K"),
     ]
     
     print(f"\n{'Config':<25} {'FP16 Linear':<12} {'BNB Linear':<12} {'Overhead':<12} {'Speedup':<10}")
@@ -357,6 +387,14 @@ def run_weight_only_int8_timing():
         (2048, 256, 1024, "V recon long"),
         (512, 1024, 1024, "Medium"),
         (2048, 4096, 4096, "XL"),
+        # Very long sequences (8K, 16K, 24K)
+        (8192, 1024, 1024, "8K: 8192x1024->1024"),
+        (16384, 1024, 1024, "16K: 16384x1024->1024"),
+        (24576, 1024, 1024, "24K: 24576x1024->1024"),
+        # V recon for very long sequences
+        (8192, 256, 1024, "V recon 8K"),
+        (16384, 256, 1024, "V recon 16K"),
+        (24576, 256, 1024, "V recon 24K"),
     ]
     
     print(f"\n{'Config':<25} {'FP16':<10} {'W-Dequant':<10} {'Matmul':<10} {'Total W8':<10} {'Speedup':<10}")
@@ -437,11 +475,21 @@ def run_linear_benchmark():
         (1, 2048, 1024, 1024, "Long prefill: 2048x1024 -> 1024"),
         (1, 2048, 4096, 4096, "Long prefill: 2048x4096 -> 4096"),
         
+        # Very long sequences (8K, 16K, 24K)
+        (1, 8192, 1024, 1024, "8K prefill: 8192x1024 -> 1024"),
+        (1, 16384, 1024, 1024, "16K prefill: 16384x1024 -> 1024"),
+        (1, 24576, 1024, 1024, "24K prefill: 24576x1024 -> 1024"),
+        
         # Typical Value reconstruction (rank -> hidden)
         (1, 1, 256, 1024, "V recon decode: 1x256 -> 1024"),
         (1, 128, 256, 1024, "V recon small: 128x256 -> 1024"),
         (1, 512, 256, 1024, "V recon med: 512x256 -> 1024"),
         (1, 2048, 256, 1024, "V recon long: 2048x256 -> 1024"),
+        
+        # V recon for very long sequences
+        (1, 8192, 256, 1024, "V recon 8K: 8192x256 -> 1024"),
+        (1, 16384, 256, 1024, "V recon 16K: 16384x256 -> 1024"),
+        (1, 24576, 256, 1024, "V recon 24K: 24576x256 -> 1024"),
         
         # Batched
         (4, 512, 1024, 1024, "Batched: 4x512x1024 -> 1024"),
@@ -547,6 +595,87 @@ def test_bnb_quantization_error():
     print(f"  Compression: {original_size / quantized_size:.1f}x")
 
 
+def run_long_sequence_summary():
+    """Summary benchmark for long sequences (8K, 16K, 24K)."""
+    import bitsandbytes as bnb
+    
+    print("\n" + "=" * 70)
+    print("Long Sequence Summary (8K, 16K, 24K)")
+    print("=" * 70)
+    
+    device = torch.device('cuda')
+    num_warmup = 10
+    num_runs = 50  # Fewer runs for long sequences
+    
+    # Configurations for standard linear and V reconstruction
+    configs = [
+        # Standard linear (1024 -> 1024)
+        (8192, 1024, 1024, "8K x 1024 -> 1024"),
+        (16384, 1024, 1024, "16K x 1024 -> 1024"),
+        (24576, 1024, 1024, "24K x 1024 -> 1024"),
+        # V reconstruction (256 -> 1024)
+        (8192, 256, 1024, "8K x 256 -> 1024 (V recon)"),
+        (16384, 256, 1024, "16K x 256 -> 1024 (V recon)"),
+        (24576, 256, 1024, "24K x 256 -> 1024 (V recon)"),
+    ]
+    
+    print(f"\n{'Config':<30} {'FP16':<10} {'BNB INT8':<10} {'W-Only INT8':<12} {'BNB Spd':<10} {'W8 Spd':<10}")
+    print("-" * 90)
+    
+    for seq_len, in_feat, out_feat, desc in configs:
+        try:
+            # Create layers
+            linear_fp16 = nn.Linear(in_feat, out_feat, bias=False).cuda().half()
+            
+            linear_bnb = bnb.nn.Linear8bitLt(
+                in_feat, out_feat,
+                bias=False,
+                has_fp16_weights=False,
+                threshold=6.0,
+            ).cuda()
+            linear_bnb.weight = bnb.nn.Int8Params(
+                linear_fp16.weight.data.clone(),
+                requires_grad=False,
+                has_fp16_weights=False,
+            ).cuda()
+            
+            # Weight-Only INT8
+            W = linear_fp16.weight.data
+            W_scale = W.abs().amax(dim=1, keepdim=True) / 127 + 1e-6
+            W_int8 = (W / W_scale).round().clamp(-128, 127).to(torch.int8)
+            
+            x = torch.randn(1, seq_len, in_feat, dtype=torch.float16, device=device)
+            
+            # FP16 benchmark
+            fp16_time = benchmark_linear(linear_fp16, x, num_warmup, num_runs)
+            
+            # BNB INT8 benchmark
+            bnb_time = benchmark_linear(linear_bnb, x, num_warmup, num_runs)
+            
+            # Weight-Only INT8 benchmark
+            def weight_only_forward():
+                W_fp16 = W_int8.half() * W_scale
+                return torch.nn.functional.linear(x.squeeze(0), W_fp16)
+            
+            w8_time = benchmark_operation(weight_only_forward, num_warmup, num_runs)
+            
+            bnb_speedup = fp16_time / bnb_time
+            w8_speedup = fp16_time / w8_time
+            
+            print(f"{desc:<30} {fp16_time:<10.3f} {bnb_time:<10.3f} {w8_time:<12.3f} {bnb_speedup:<10.2f}x {w8_speedup:<10.2f}x")
+            
+            del linear_fp16, linear_bnb, x, W, W_int8, W_scale
+            torch.cuda.empty_cache()
+            
+        except Exception as e:
+            print(f"{desc:<30} ERROR: {e}")
+    
+    print("\n说明:")
+    print("  - BNB Spd: bitsandbytes INT8 相对 FP16 的加速比")
+    print("  - W8 Spd: Weight-Only INT8 相对 FP16 的加速比")
+    print("  - Speedup > 1.0 表示比 FP16 快")
+
+
 def compare_with_torch_int8():
     """Compare bitsandbytes INT8 with torch._int_mm."""
     import bitsandbytes as bnb
@@ -629,6 +758,9 @@ if __name__ == "__main__":
     run_bnb_linear_breakdown()
     run_weight_only_int8_timing()
     
+    # Long sequence summary (8K, 16K, 24K)
+    run_long_sequence_summary()
+    
     # Original benchmarks
     run_linear_benchmark()
     test_bnb_quantization_error()
@@ -653,18 +785,25 @@ if __name__ == "__main__":
    - 例如: FP16 计算 0.01ms, 但量化开销 0.2ms
    - 只有大矩阵 (>2048x4096) 才能看到加速
 
-3. Weight-Only INT8 优势:
+3. 长序列 (8K, 16K, 24K) 表现:
+   - 8K x 1024 -> 1024: 可能开始看到加速
+   - 16K x 1024 -> 1024: INT8 加速更明显
+   - 24K x 1024 -> 1024: INT8 加速效果最好
+   - V recon (8K/16K/24K x 256 -> 1024): 仍然受限于小 K 维度
+
+4. Weight-Only INT8 优势:
    - 节省 50% 权重显存
    - 反量化开销比 bnb 小
    - 适合显存受限场景
 
-4. 对 Value 重建的建议 (256x1024):
-   - FP16 最快 (小矩阵)
+5. 对 Value 重建的建议 (256x1024):
+   - 短序列 (<2K): FP16 最快
+   - 长序列 (8K+): 可能有加速，取决于具体硬件
    - 如果显存紧张，用 Weight-Only INT8
-   - 不推荐 bnb.nn.Linear8bitLt (开销太大)
 
-5. 如果需要加速:
+6. 如果需要加速:
    - 考虑 FP8 (L20 原生支持)
    - 考虑 torch.compile 优化 FP16
    - 考虑 kernel fusion (避免多次访存)
+   - 长序列场景下 INT8 可能有优势
     """)
