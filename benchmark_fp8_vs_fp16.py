@@ -5,6 +5,10 @@ FP8 在 Ada Lovelace (L20, RTX 40xx) 上原生支持
 - 输出直接是 FP16，避免了 INT8 的 INT32 输出问题
 - E4M3: 适合权重和激活 (范围 ±448)
 - E5M2: 适合梯度 (范围更大)
+
+注意: torch._scaled_mm 要求:
+- A: row-major (正常连续)
+- B: column-major (需要转置)
 """
 
 import torch
@@ -53,6 +57,24 @@ def check_fp8_support():
         print("   升级: pip install torch>=2.1")
         return False
     
+    # 测试 _scaled_mm
+    print("\n测试 torch._scaled_mm...")
+    try:
+        A = torch.randn(16, 32, dtype=torch.float16, device='cuda')
+        B = torch.randn(64, 32, dtype=torch.float16, device='cuda')  # 注意: (N, K) 然后转置
+        
+        A_fp8 = A.to(torch.float8_e4m3fn)
+        B_fp8 = B.to(torch.float8_e4m3fn).t().contiguous().t()  # 确保 column-major
+        
+        scale_a = torch.tensor(1.0, dtype=torch.float32, device='cuda')
+        scale_b = torch.tensor(1.0, dtype=torch.float32, device='cuda')
+        
+        C = torch._scaled_mm(A_fp8, B_fp8.t(), scale_a=scale_a, scale_b=scale_b, out_dtype=torch.float16)
+        print(f"✓ _scaled_mm 测试通过, 输出 shape: {C.shape}")
+    except Exception as e:
+        print(f"❌ _scaled_mm 测试失败: {e}")
+        return False
+    
     print("\n✓ FP8 完全支持!")
     return True
 
@@ -88,8 +110,9 @@ def quantize_to_fp8(x, dtype=torch.float8_e4m3fn):
     
     # 计算 scale 使得 x / scale 在 FP8 范围内
     amax = x.abs().amax()
+    if amax == 0:
+        amax = torch.tensor(1.0, device=x.device)
     scale = amax / max_val
-    scale = torch.where(scale > 0, scale, torch.ones_like(scale))
     
     # 量化
     x_scaled = x / scale
@@ -107,13 +130,49 @@ def quantize_to_fp8_per_token(x, dtype=torch.float8_e4m3fn):
     
     # Per-token scale
     amax = x.abs().amax(dim=-1, keepdim=True)
+    amax = torch.where(amax > 0, amax, torch.ones_like(amax))
     scale = amax / max_val
-    scale = torch.where(scale > 0, scale, torch.ones_like(scale))
     
     x_scaled = x / scale
     x_fp8 = x_scaled.to(dtype)
     
     return x_fp8, scale
+
+
+def fp8_matmul(A_fp8, B_fp8, A_scale, B_scale):
+    """FP8 矩阵乘法.
+    
+    torch._scaled_mm 要求:
+    - A: (M, K) row-major
+    - B: (K, N) column-major (即 B.t() 是 row-major)
+    
+    所以我们需要:
+    - A: 正常的 (M, K)
+    - B_t: (N, K) row-major, 然后传入 B_t.t() 作为 column-major 的 (K, N)
+    """
+    # scale 需要是 scale 的倒数 (用于 dequant)
+    scale_a = A_scale.to(torch.float32)
+    scale_b = B_scale.to(torch.float32)
+    
+    return torch._scaled_mm(
+        A_fp8, 
+        B_fp8,
+        scale_a=scale_a,
+        scale_b=scale_b,
+        out_dtype=torch.float16
+    )
+
+
+def prepare_fp8_weight(B_fp16):
+    """准备 FP8 权重 (column-major).
+    
+    对于 A @ B where A is (M, K) and B is (K, N):
+    _scaled_mm 需要 B 是 column-major, 即 B.t() 应该是连续的
+    """
+    B_fp8, B_scale = quantize_to_fp8(B_fp16)
+    # 转换为 column-major: 先转置，确保连续，再转置回来
+    B_fp8_col = B_fp8.t().contiguous().t()
+    return B_fp8_col, B_scale
 
 
 def run_basic_comparison():
@@ -134,14 +193,10 @@ def run_basic_comparison():
     
     # FP8 量化
     A_fp8, A_scale = quantize_to_fp8(A_fp16)
-    B_fp8, B_scale = quantize_to_fp8(B_fp16)
+    B_fp8_col, B_scale = prepare_fp8_weight(B_fp16)
     
-    # Scale tensors
-    A_scale_inv = (1.0 / A_scale).to(torch.float32)
-    B_scale_inv = (1.0 / B_scale).to(torch.float32)
-    
-    print(f"\nA_fp8 dtype: {A_fp8.dtype}")
-    print(f"B_fp8 dtype: {B_fp8.dtype}")
+    print(f"\nA_fp8 dtype: {A_fp8.dtype}, shape: {A_fp8.shape}")
+    print(f"B_fp8 dtype: {B_fp8_col.dtype}, shape: {B_fp8_col.shape}")
     print(f"A_scale: {A_scale.item():.6f}")
     print(f"B_scale: {B_scale.item():.6f}")
     
@@ -149,15 +204,10 @@ def run_basic_comparison():
     fp16_time = benchmark(lambda: torch.matmul(A_fp16, B_fp16), 10, 50)
     
     # FP8 matmul
-    def fp8_matmul():
-        return torch._scaled_mm(
-            A_fp8, B_fp8,
-            scale_a=A_scale_inv,
-            scale_b=B_scale_inv,
-            out_dtype=torch.float16
-        )
+    def fp8_mm():
+        return fp8_matmul(A_fp8, B_fp8_col, A_scale, B_scale)
     
-    fp8_time = benchmark(fp8_matmul, 10, 50)
+    fp8_time = benchmark(fp8_mm, 10, 50)
     
     print(f"\n{'方法':<20} {'时间 (ms)':<15} {'加速比':<10}")
     print("-" * 50)
@@ -171,7 +221,7 @@ def run_basic_comparison():
     print(f"\nFP16 TFLOPS: {fp16_tflops:.2f}")
     print(f"FP8 TFLOPS:  {fp8_tflops:.2f}")
     
-    del A_fp16, B_fp16, A_fp8, B_fp8
+    del A_fp16, B_fp16, A_fp8, B_fp8_col
     torch.cuda.empty_cache()
 
 
@@ -272,24 +322,21 @@ def run_matrix_size_comparison():
             
             # 预量化
             A_fp8, A_scale = quantize_to_fp8(A_fp16)
-            B_fp8, B_scale = quantize_to_fp8(B_fp16)
-            A_scale_inv = (1.0 / A_scale).to(torch.float32)
-            B_scale_inv = (1.0 / B_scale).to(torch.float32)
+            B_fp8_col, B_scale = prepare_fp8_weight(B_fp16)
             
             # FP16
             fp16_time = benchmark(lambda: torch.matmul(A_fp16, B_fp16), 10, 50)
             
             # FP8 (预量化)
-            def fp8_matmul():
-                return torch._scaled_mm(A_fp8, B_fp8, scale_a=A_scale_inv, scale_b=B_scale_inv, out_dtype=torch.float16)
+            def fp8_mm():
+                return fp8_matmul(A_fp8, B_fp8_col, A_scale, B_scale)
             
-            fp8_time = benchmark(fp8_matmul, 10, 50)
+            fp8_time = benchmark(fp8_mm, 10, 50)
             
             # FP8 完整流程 (含量化)
             def fp8_full():
                 a_fp8, a_s = quantize_to_fp8(A_fp16)
-                a_s_inv = (1.0 / a_s).to(torch.float32)
-                return torch._scaled_mm(a_fp8, B_fp8, scale_a=a_s_inv, scale_b=B_scale_inv, out_dtype=torch.float16)
+                return fp8_matmul(a_fp8, B_fp8_col, a_s, B_scale)
             
             fp8_full_time = benchmark(fp8_full, 10, 50)
             
@@ -297,7 +344,7 @@ def run_matrix_size_comparison():
             
             print(f"{desc:<25} {fp16_time:<12.4f} {fp8_time:<12.4f} {fp8_full_time:<12.4f} {speedup:<10.2f}x")
             
-            del A_fp16, B_fp16, A_fp8, B_fp8
+            del A_fp16, B_fp16, A_fp8, B_fp8_col
             torch.cuda.empty_cache()
             
         except torch.cuda.OutOfMemoryError:
@@ -318,8 +365,7 @@ def run_batch_seq_comparison():
     
     # 预量化权重
     B_fp16 = torch.randn(K, N, dtype=torch.float16, device=device)
-    B_fp8, B_scale = quantize_to_fp8(B_fp16)
-    B_scale_inv = (1.0 / B_scale).to(torch.float32)
+    B_fp8_col, B_scale = prepare_fp8_weight(B_fp16)
     
     print(f"\n{'Batch':<8} {'Seq':<8} {'M':<12} {'FP16':<12} {'FP8':<12} {'Speedup':<10}")
     print("-" * 65)
@@ -351,12 +397,11 @@ def run_batch_seq_comparison():
             
             A_fp16 = torch.randn(M, K, dtype=torch.float16, device=device)
             A_fp8, A_scale = quantize_to_fp8(A_fp16)
-            A_scale_inv = (1.0 / A_scale).to(torch.float32)
             
             fp16_time = benchmark(lambda: torch.matmul(A_fp16, B_fp16), 10, 50)
             
             def fp8_mm():
-                return torch._scaled_mm(A_fp8, B_fp8, scale_a=A_scale_inv, scale_b=B_scale_inv, out_dtype=torch.float16)
+                return fp8_matmul(A_fp8, B_fp8_col, A_scale, B_scale)
             
             fp8_time = benchmark(fp8_mm, 10, 50)
             
@@ -373,7 +418,7 @@ def run_batch_seq_comparison():
         except Exception as e:
             print(f"{batch:<8} {seq:<8} ERROR: {e}")
     
-    del B_fp16, B_fp8
+    del B_fp16, B_fp8_col
     torch.cuda.empty_cache()
 
 
@@ -417,14 +462,12 @@ def run_value_reconstruction_comparison():
             B_fp16 = torch.randn(K, N, dtype=torch.float16, device=device)
             
             A_fp8, A_scale = quantize_to_fp8(A_fp16)
-            B_fp8, B_scale = quantize_to_fp8(B_fp16)
-            A_scale_inv = (1.0 / A_scale).to(torch.float32)
-            B_scale_inv = (1.0 / B_scale).to(torch.float32)
+            B_fp8_col, B_scale = prepare_fp8_weight(B_fp16)
             
             fp16_time = benchmark(lambda: torch.matmul(A_fp16, B_fp16), 10, 50)
             
             def fp8_mm():
-                return torch._scaled_mm(A_fp8, B_fp8, scale_a=A_scale_inv, scale_b=B_scale_inv, out_dtype=torch.float16)
+                return fp8_matmul(A_fp8, B_fp8_col, A_scale, B_scale)
             
             fp8_time = benchmark(fp8_mm, 10, 50)
             
@@ -432,7 +475,7 @@ def run_value_reconstruction_comparison():
             
             print(f"{batch:<8} {seq:<8} {rank:<8} {hidden:<8} {fp16_time:<10.4f} {fp8_time:<10.4f} {speedup:<10.2f}x")
             
-            del A_fp16, B_fp16, A_fp8, B_fp8
+            del A_fp16, B_fp16, A_fp8, B_fp8_col
             torch.cuda.empty_cache()
             
         except torch.cuda.OutOfMemoryError:
@@ -456,21 +499,22 @@ def run_end_to_end_comparison():
     A_fp16 = torch.randn(M, K, dtype=torch.float16, device=device)
     B_fp16 = torch.randn(K, N, dtype=torch.float16, device=device)
     
-    # 预量化
+    # FP8 预量化
     A_fp8, A_scale = quantize_to_fp8(A_fp16)
-    B_fp8, B_scale = quantize_to_fp8(B_fp16)
-    A_scale_inv = (1.0 / A_scale).to(torch.float32)
-    B_scale_inv = (1.0 / B_scale).to(torch.float32)
+    B_fp8_col, B_scale = prepare_fp8_weight(B_fp16)
     
-    A_int8 = (A_fp16 / (A_fp16.abs().amax() / 127)).round().clamp(-128, 127).to(torch.int8)
-    B_int8 = (B_fp16 / (B_fp16.abs().amax() / 127)).round().clamp(-128, 127).to(torch.int8)
+    # INT8 预量化
+    A_int8_scale = A_fp16.abs().amax() / 127
+    A_int8 = (A_fp16 / A_int8_scale).round().clamp(-128, 127).to(torch.int8)
+    B_int8_scale = B_fp16.abs().amax() / 127
+    B_int8 = (B_fp16 / B_int8_scale).round().clamp(-128, 127).to(torch.int8)
     
     # FP16
     fp16_time = benchmark(lambda: torch.matmul(A_fp16, B_fp16), 10, 50)
     
     # FP8 (预量化)
     def fp8_mm():
-        return torch._scaled_mm(A_fp8, B_fp8, scale_a=A_scale_inv, scale_b=B_scale_inv, out_dtype=torch.float16)
+        return fp8_matmul(A_fp8, B_fp8_col, A_scale, B_scale)
     
     fp8_time = benchmark(fp8_mm, 10, 50)
     
@@ -480,10 +524,18 @@ def run_end_to_end_comparison():
     # FP8 完整流程
     def fp8_full():
         a_fp8, a_s = quantize_to_fp8(A_fp16)
-        a_s_inv = (1.0 / a_s).to(torch.float32)
-        return torch._scaled_mm(a_fp8, B_fp8, scale_a=a_s_inv, scale_b=B_scale_inv, out_dtype=torch.float16)
+        return fp8_matmul(a_fp8, B_fp8_col, a_s, B_scale)
     
     fp8_full_time = benchmark(fp8_full, 10, 50)
+    
+    # INT8 完整流程
+    def int8_full():
+        a_s = A_fp16.abs().amax() / 127
+        a_i = (A_fp16 / a_s).round().clamp(-128, 127).to(torch.int8)
+        c = torch._int_mm(a_i, B_int8)
+        return c.half() * a_s * B_int8_scale
+    
+    int8_full_time = benchmark(int8_full, 10, 50)
     
     print(f"\n{'方法':<30} {'时间 (ms)':<15} {'加速比':<10}")
     print("-" * 60)
@@ -491,6 +543,7 @@ def run_end_to_end_comparison():
     print(f"{'FP8 (预量化)':<30} {fp8_time:<15.4f} {fp16_time/fp8_time:.2f}x")
     print(f"{'FP8 (含量化)':<30} {fp8_full_time:<15.4f} {fp16_time/fp8_full_time:.2f}x")
     print(f"{'INT8 (预量化, INT32输出)':<30} {int8_time:<15.4f} {fp16_time/int8_time:.2f}x")
+    print(f"{'INT8 (含量化+转换)':<30} {int8_full_time:<15.4f} {fp16_time/int8_full_time:.2f}x")
     
     # TFLOPS
     flops = 2 * M * K * N
@@ -499,7 +552,7 @@ def run_end_to_end_comparison():
     print(f"  FP8:  {flops / (fp8_time / 1000) / 1e12:.2f} TFLOPS")
     print(f"  INT8: {flops / (int8_time / 1000) / 1e12:.2f} TOPS")
     
-    del A_fp16, B_fp16, A_fp8, B_fp8, A_int8, B_int8
+    del A_fp16, B_fp16, A_fp8, B_fp8_col, A_int8, B_int8
     torch.cuda.empty_cache()
 
 
@@ -575,6 +628,10 @@ FP8 vs INT8 关键区别:
 4. **硬件支持**:
    - FP8: Ada Lovelace+ (L20, RTX 40xx) 原生支持
    - INT8: 所有支持 Tensor Core 的 GPU
+
+5. **cuBLASLt 要求**:
+   - torch._scaled_mm 要求 B 是 column-major
+   - 使用 B.t().contiguous().t() 转换
 
 建议:
 - 如果有 Ada Lovelace GPU (L20)，优先使用 FP8
