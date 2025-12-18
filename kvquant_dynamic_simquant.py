@@ -21,12 +21,64 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# 动态量化函数
+# Straight-Through Estimator (STE) for gradient
 # ============================================================================
+
+class STEQuantize(torch.autograd.Function):
+    """
+    Straight-Through Estimator: forward 做量化，backward 直接传梯度
+    """
+    @staticmethod
+    def forward(ctx, x, bits, qchannel, include_sparse, sparsity_threshold):
+        if bits >= 16:
+            return x
+        
+        x_float = x.float()
+        
+        # 检测 outliers
+        outlier_mask = None
+        if include_sparse:
+            t = 1 - ((1 - sparsity_threshold) / 2)
+            upper = torch.quantile(x_float.detach(), t, dim=qchannel, keepdim=True)
+            lower = torch.quantile(x_float.detach(), 1 - t, dim=qchannel, keepdim=True)
+            outlier_mask = (x_float > upper) | (x_float < lower)
+        
+        # 计算量化范围
+        if include_sparse and outlier_mask is not None:
+            x_masked = x_float.detach().clone()
+            x_masked[outlier_mask] = 0
+            non_outlier_count = (~outlier_mask).sum(dim=qchannel, keepdim=True).clamp(min=1)
+            x_sum = x_masked.sum(dim=qchannel, keepdim=True)
+            x_mean = x_sum / non_outlier_count
+            x_masked[outlier_mask] = x_mean.expand_as(x_masked)[outlier_mask]
+            maxval = x_masked.max(dim=qchannel, keepdim=True).values
+            minval = x_masked.min(dim=qchannel, keepdim=True).values
+        else:
+            maxval = x_float.detach().max(dim=qchannel, keepdim=True).values
+            minval = x_float.detach().min(dim=qchannel, keepdim=True).values
+        
+        # 量化
+        scale = (2**bits - 1) / (maxval - minval).clamp(min=1e-8)
+        zero_point = minval * scale
+        
+        qx = torch.round(scale * x_float - zero_point).clamp(0, 2**bits - 1)
+        x_dequant = (qx + zero_point) / scale
+        
+        # 恢复 outliers
+        if include_sparse and outlier_mask is not None:
+            x_dequant = torch.where(outlier_mask, x_float, x_dequant)
+        
+        return x_dequant.to(x.dtype)
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        # Straight-through: 梯度直接传递
+        return grad_output, None, None, None, None
+
 
 def dynamic_quantize(x, bits, qchannel=-1, include_sparse=False, sparsity_threshold=0.99):
     """
-    动态量化：在 forward 时计算所有参数
+    动态量化：在 forward 时计算所有参数，支持梯度传播 (STE)
     
     Args:
         x: 输入 tensor
@@ -35,46 +87,7 @@ def dynamic_quantize(x, bits, qchannel=-1, include_sparse=False, sparsity_thresh
         include_sparse: 是否使用稀疏量化 (outliers 保持 FP16)
         sparsity_threshold: outlier 阈值 (如 0.99 = 1% outliers)
     """
-    if bits >= 16:
-        return x
-    
-    x_float = x.float()
-    
-    # 检测 outliers
-    outlier_mask = None
-    if include_sparse:
-        t = 1 - ((1 - sparsity_threshold) / 2)
-        upper = torch.quantile(x_float, t, dim=qchannel, keepdim=True)
-        lower = torch.quantile(x_float, 1 - t, dim=qchannel, keepdim=True)
-        outlier_mask = (x_float > upper) | (x_float < lower)
-    
-    # 计算量化范围
-    if include_sparse and outlier_mask is not None:
-        # 排除 outliers 计算范围
-        x_masked = x_float.clone()
-        x_masked[outlier_mask] = 0
-        non_outlier_count = (~outlier_mask).sum(dim=qchannel, keepdim=True).clamp(min=1)
-        x_sum = x_masked.sum(dim=qchannel, keepdim=True)
-        x_mean = x_sum / non_outlier_count
-        x_masked[outlier_mask] = x_mean.expand_as(x_masked)[outlier_mask]
-        maxval = x_masked.max(dim=qchannel, keepdim=True).values
-        minval = x_masked.min(dim=qchannel, keepdim=True).values
-    else:
-        maxval = x_float.max(dim=qchannel, keepdim=True).values
-        minval = x_float.min(dim=qchannel, keepdim=True).values
-    
-    # 量化
-    scale = (2**bits - 1) / (maxval - minval).clamp(min=1e-8)
-    zero_point = minval * scale
-    
-    qx = torch.round(scale * x_float - zero_point).clamp(0, 2**bits - 1)
-    x_dequant = (qx + zero_point) / scale
-    
-    # 恢复 outliers
-    if include_sparse and outlier_mask is not None:
-        x_dequant[outlier_mask] = x_float[outlier_mask]
-    
-    return x_dequant.to(x.dtype)
+    return STEQuantize.apply(x, bits, qchannel, include_sparse, sparsity_threshold)
 
 
 # ============================================================================
