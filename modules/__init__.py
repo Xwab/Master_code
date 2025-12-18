@@ -44,6 +44,16 @@ from .kivi_mixed_cache_v2 import (
 from .svd_linear import SVDLinear
 from .hadamard_utils import apply_hadamard
 
+# INT8 matmul for value reconstruction
+from .int8_matmul import (
+    Int8Quantizer,
+    Int8Linear,
+    Int8ValueReconstructor,
+    create_int8_value_reconstructor,
+    convert_alinear_to_int8,
+    INT8_SUPPORTED,
+)
+
 __all__ = [
     # Legacy quantization
     "Quantizer",
@@ -78,4 +88,11 @@ __all__ = [
     # SVD
     "SVDLinear",
     "apply_hadamard",
+    # INT8 matmul
+    "Int8Quantizer",
+    "Int8Linear",
+    "Int8ValueReconstructor",
+    "create_int8_value_reconstructor",
+    "convert_alinear_to_int8",
+    "INT8_SUPPORTED",
 ]

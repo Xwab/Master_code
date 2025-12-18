@@ -108,6 +108,9 @@ class ALRDLlamaConfig(LlamaConfig):
         self.mixed_v2_high_bits = kwargs.pop('mixed_v2_high_bits', 6)  # Value 高精度用 6bit
         self.mixed_v2_low_bits = kwargs.pop('mixed_v2_low_bits', 4)  # Value 低精度用 4bit
         
+        # INT8 value reconstruction (W8A8 matmul for faster ALinear)
+        self.use_int8_reconstruction = kwargs.pop('use_int8_reconstruction', False)
+        
         # ALinear weight quantization
         self.a_weight_bits = a_weight_bits
         self.a_weight_group_size = a_weight_group_size

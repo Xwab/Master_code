@@ -35,6 +35,12 @@ from modules.kivi_mixed_cache_v2 import (
     create_mixed_precision_cache_v2,
     calculate_mixed_precision_split_v2,
 )
+from modules.int8_matmul import (
+    Int8Linear,
+    Int8ValueReconstructor,
+    create_int8_value_reconstructor,
+    INT8_SUPPORTED,
+)
 
 # Union type for all KIVI-style caches
 KIVI_CACHE_TYPES = (KIVILatentCache, KIVIMixedPrecisionCache, KIVIMixedPrecisionCacheV2)
@@ -45,14 +51,26 @@ logger = logging.get_logger(__name__)
 class CustomLlamaSdpaAttention(LlamaSdpaAttention):
     def __init__(self, config, layer_idx=None):
         super().__init__(config, layer_idx)
-        # KIVI-style quantizer for ALinear weight
-        # Use per-channel quantization (each output channel has its own scale)
+        # KIVI-style quantizer for ALinear weight (fallback)
         self.a_weight_bits = getattr(config, 'a_weight_bits', 8)
         self.a_weight_group_size = getattr(config, 'a_weight_group_size', 128)
         self.quantizer = KIVIValueQuantizer(
             n_bits=self.a_weight_bits, 
             group_size=self.a_weight_group_size
         )
+        
+        # INT8 reconstruction option
+        self.use_int8_reconstruction = getattr(config, 'use_int8_reconstruction', False)
+        self.int8_value_reconstructor = None  # Will be initialized after v_proj is set
+    
+    def setup_int8_reconstruction(self):
+        """Setup INT8 reconstruction for value. Call after v_proj is set."""
+        if hasattr(self, 'v_proj') and hasattr(self.v_proj, 'ALinear'):
+            self.int8_value_reconstructor = Int8ValueReconstructor.from_linear(
+                self.v_proj.ALinear
+            )
+            self.use_int8_reconstruction = True
+            print(f"[INT8] Layer {self.layer_idx}: Setup INT8 value reconstruction")
 
     def forward(
             self,
@@ -113,8 +131,15 @@ class CustomLlamaSdpaAttention(LlamaSdpaAttention):
 
         # Restore full dimension from low-rank latent
         key_states = self.k_proj.ALinear(key_states)
-        quantized_value_A_Linear = self.quantizer(self.v_proj.ALinear.weight.data)
-        value_states = torch.matmul(value_states, quantized_value_A_Linear.t())
+        
+        # Value reconstruction: use INT8 matmul if enabled, otherwise use quantized FP16
+        if self.use_int8_reconstruction and self.int8_value_reconstructor is not None:
+            # W8A8 INT8 matmul for value reconstruction
+            value_states = self.int8_value_reconstructor(value_states)
+        else:
+            # Fallback: quantize ALinear weight and use FP16 matmul
+            quantized_value_A_Linear = self.quantizer(self.v_proj.ALinear.weight.data)
+            value_states = torch.matmul(value_states, quantized_value_A_Linear.t())
 
         #value_states_high = value_states[:, :, :high_bit_rank_num]
         #value_states_high = torch.matmul(value_states_high.to(torch.float32), quantized_value_A_Linear_high.t().to(torch.float32))
@@ -194,13 +219,27 @@ class CustomLlamaFlashAttention2(LlamaFlashAttention2):
         # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).
         self._flash_attn_uses_top_left_mask = True#not is_flash_attn_greater_or_equal_2_10()
         
-        # KIVI-style quantizer for ALinear weight
+        # KIVI-style quantizer for ALinear weight (fallback)
         self.a_weight_bits = getattr(config, 'a_weight_bits', 8)
         self.a_weight_group_size = getattr(config, 'a_weight_group_size', 128)
         self.quantizer = KIVIValueQuantizer(
             n_bits=self.a_weight_bits, 
             group_size=self.a_weight_group_size
         )
+        
+        # INT8 reconstruction option
+        self.use_int8_reconstruction = getattr(config, 'use_int8_reconstruction', False)
+        self.int8_value_reconstructor = None  # Will be initialized after v_proj is set
+    
+    def setup_int8_reconstruction(self):
+        """Setup INT8 reconstruction for value. Call after v_proj is set."""
+        if hasattr(self, 'v_proj') and hasattr(self.v_proj, 'ALinear'):
+            self.int8_value_reconstructor = Int8ValueReconstructor.from_linear(
+                self.v_proj.ALinear
+            )
+            self.use_int8_reconstruction = True
+            print(f"[INT8] Layer {self.layer_idx}: Setup INT8 value reconstruction (FlashAttn)")
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -254,8 +293,15 @@ class CustomLlamaFlashAttention2(LlamaFlashAttention2):
 
         # Restore full dimension from low-rank latent
         key_states = self.k_proj.ALinear(key_states)
-        quantized_value_A_Linear = self.quantizer(self.v_proj.ALinear.weight.data)
-        value_states = torch.matmul(value_states, quantized_value_A_Linear.t())
+        
+        # Value reconstruction: use INT8 matmul if enabled, otherwise use quantized FP16
+        if self.use_int8_reconstruction and self.int8_value_reconstructor is not None:
+            # W8A8 INT8 matmul for value reconstruction
+            value_states = self.int8_value_reconstructor(value_states)
+        else:
+            # Fallback: quantize ALinear weight and use FP16 matmul
+            quantized_value_A_Linear = self.quantizer(self.v_proj.ALinear.weight.data)
+            value_states = torch.matmul(value_states, quantized_value_A_Linear.t())
 
         _, k_len, _ = key_states.size()
         key_states = key_states.view(bsz, k_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -1523,6 +1569,40 @@ class ALRDLlamaForCausalLM(LlamaForCausalLM):
                         continue
                 
                 setattr(info["father"], info["name"], new_layer)
+    
+    def enable_int8_reconstruction(self, verbose: bool = True):
+        """
+        Enable INT8 value reconstruction for all attention layers.
+        
+        This converts the ALinear weight to INT8 and uses W8A8 INT8 matmul
+        for value reconstruction, which can speed up inference.
+        
+        Args:
+            verbose: Print conversion info
+        
+        Returns:
+            Number of layers converted
+        """
+        if not INT8_SUPPORTED:
+            print(f"[INT8] Warning: INT8 matmul not supported on this platform. Using fake quantization.")
+        
+        converted = 0
+        for name, module in self.model.named_modules():
+            if hasattr(module, 'setup_int8_reconstruction'):
+                module.setup_int8_reconstruction()
+                converted += 1
+        
+        if verbose:
+            print(f"[INT8] Enabled INT8 reconstruction for {converted} attention layers")
+        
+        return converted
+    
+    def disable_int8_reconstruction(self):
+        """Disable INT8 reconstruction for all attention layers."""
+        for name, module in self.model.named_modules():
+            if hasattr(module, 'use_int8_reconstruction'):
+                module.use_int8_reconstruction = False
+        print("[INT8] Disabled INT8 reconstruction")
     
     def create_kivi_cache(self) -> KIVILatentCache:
         """
