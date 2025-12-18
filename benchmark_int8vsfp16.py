@@ -481,6 +481,144 @@ def run_w8a8_int8():
 # Long Sequence Summary
 # ============================================================================
 
+def run_per_token_quantization():
+    """Benchmark per-token quantization (KIVI-style for Value)."""
+    print("\n" + "=" * 70)
+    print("Per-Token Quantization Benchmark (KIVI Value Style)")
+    print("=" * 70)
+    
+    device = torch.device('cuda')
+    num_warmup = 10
+    num_runs = 50
+    
+    # (batch, seq_len, hidden_dim, desc)
+    configs = [
+        (1, 2048, 1024, "B1 x 2K x 1024"),
+        (1, 8192, 1024, "B1 x 8K x 1024"),
+        (1, 16384, 1024, "B1 x 16K x 1024"),
+        (1, 24576, 1024, "B1 x 24K x 1024"),
+        (4, 2048, 1024, "B4 x 2K x 1024"),
+        (8, 2048, 1024, "B8 x 2K x 1024"),
+        (16, 2048, 1024, "B16 x 2K x 1024"),
+        (4, 8192, 1024, "B4 x 8K x 1024"),
+        (8, 8192, 1024, "B8 x 8K x 1024"),
+        # Value latent
+        (1, 8192, 256, "V: B1 x 8K x 256"),
+        (4, 8192, 256, "V: B4 x 8K x 256"),
+        (8, 8192, 256, "V: B8 x 8K x 256"),
+        (4, 16384, 256, "V: B4 x 16K x 256"),
+        (4, 24576, 256, "V: B4 x 24K x 256"),
+    ]
+    
+    print(f"\n{'Config':<25} {'Per-Tensor':<12} {'Per-Token':<12} {'Overhead':<12}")
+    print("-" * 65)
+    
+    for batch, seq_len, hidden_dim, desc in configs:
+        try:
+            V = torch.randn(batch, seq_len, hidden_dim, dtype=torch.float16, device=device)
+            
+            # Per-tensor
+            def quant_pt():
+                s = V.abs().amax() / 127 + 1e-6
+                return (V / s).round().clamp(-128, 127).to(torch.int8), s
+            
+            pt_time = benchmark_operation(quant_pt, num_warmup, num_runs)
+            
+            # Per-token
+            def quant_tk():
+                s = V.abs().amax(dim=-1, keepdim=True) / 127 + 1e-6
+                return (V / s).round().clamp(-128, 127).to(torch.int8), s
+            
+            tk_time = benchmark_operation(quant_tk, num_warmup, num_runs)
+            
+            overhead = tk_time - pt_time
+            
+            print(f"{desc:<25} {pt_time:<12.4f} {tk_time:<12.4f} {overhead:<12.4f}")
+            
+            del V
+            torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"{desc:<25} ERROR: {e}")
+
+
+def run_large_batch_matmul():
+    """Benchmark matmul with large batch sizes and per-token quantization."""
+    print("\n" + "=" * 70)
+    print("Large Batch INT8 Matmul (Per-Token Quantization)")
+    print("=" * 70)
+    
+    device = torch.device('cuda')
+    num_warmup = 10
+    num_runs = 50
+    
+    # (batch, seq_len, K, N, desc)
+    configs = [
+        # Varying batch with fixed seq_len
+        (1, 2048, 256, 1024, "B1 x 2K, 256->1024"),
+        (4, 2048, 256, 1024, "B4 x 2K, 256->1024"),
+        (8, 2048, 256, 1024, "B8 x 2K, 256->1024"),
+        (16, 2048, 256, 1024, "B16 x 2K, 256->1024"),
+        (32, 2048, 256, 1024, "B32 x 2K, 256->1024"),
+        
+        # Large batch with long sequence
+        (4, 8192, 256, 1024, "B4 x 8K, 256->1024"),
+        (8, 8192, 256, 1024, "B8 x 8K, 256->1024"),
+        (4, 16384, 256, 1024, "B4 x 16K, 256->1024"),
+        (4, 24576, 256, 1024, "B4 x 24K, 256->1024"),
+        
+        # Larger K and N
+        (4, 8192, 512, 4096, "B4 x 8K, 512->4096"),
+        (8, 8192, 512, 4096, "B8 x 8K, 512->4096"),
+        (4, 8192, 1024, 4096, "B4 x 8K, 1024->4096"),
+    ]
+    
+    print(f"\n{'Config':<25} {'FP16':<10} {'INT8只':<10} {'INT8 Full':<10} {'Speedup':<10}")
+    print("-" * 70)
+    
+    for batch, seq_len, K, N, desc in configs:
+        try:
+            M = batch * seq_len
+            
+            A = torch.randn(M, K, dtype=torch.float16, device=device)
+            W = torch.randn(K, N, dtype=torch.float16, device=device)
+            
+            # Pre-quantize weight
+            W_scale = W.abs().amax() / 127 + 1e-6
+            W_int8 = (W / W_scale).round().clamp(-128, 127).to(torch.int8)
+            
+            # Pre-quantize activation (per-token)
+            A_scale = A.abs().amax(dim=-1, keepdim=True) / 127 + 1e-6
+            A_int8 = (A / A_scale).round().clamp(-128, 127).to(torch.int8)
+            
+            # FP16
+            fp16_time = benchmark_operation(lambda: torch.matmul(A, W), num_warmup, num_runs)
+            
+            # INT8 only
+            int8_time = benchmark_operation(lambda: torch._int_mm(A_int8, W_int8), num_warmup, num_runs)
+            
+            # Full INT8 with per-token quant
+            def int8_full():
+                a_s = A.abs().amax(dim=-1, keepdim=True) / 127 + 1e-6
+                a_i = (A / a_s).round().clamp(-128, 127).to(torch.int8)
+                c = torch._int_mm(a_i, W_int8)
+                return c.half() * a_s * W_scale
+            
+            full_time = benchmark_operation(int8_full, num_warmup, num_runs)
+            
+            speedup = fp16_time / int8_time
+            
+            print(f"{desc:<25} {fp16_time:<10.4f} {int8_time:<10.4f} {full_time:<10.4f} {speedup:<10.2f}x")
+            
+            del A, W, A_int8, W_int8
+            torch.cuda.empty_cache()
+            
+        except torch.cuda.OutOfMemoryError:
+            print(f"{desc:<25} OOM")
+            torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"{desc:<25} ERROR: {e}")
+
+
 def run_long_sequence_summary():
     """Summary for long sequences (8K, 16K, 24K)."""
     print("\n" + "=" * 70)
@@ -500,6 +638,10 @@ def run_long_sequence_summary():
         (8192, 256, 1024, "8K x 256 -> 1024 (V)"),
         (16384, 256, 1024, "16K x 256 -> 1024 (V)"),
         (24576, 256, 1024, "24K x 256 -> 1024 (V)"),
+        # Large batch
+        (4 * 8192, 256, 1024, "B4x8K x 256 -> 1024"),
+        (8 * 8192, 256, 1024, "B8x8K x 256 -> 1024"),
+        (4 * 16384, 256, 1024, "B4x16K x 256 -> 1024"),
     ]
     
     print(f"\n{'Config':<30} {'FP16':<10} {'int_mm只':<10} {'W8A8全':<10} {'W-Only':<10} {'int_mm Spd':<10} {'W8A8 Spd':<10}")
@@ -614,6 +756,11 @@ if __name__ == "__main__":
     run_pure_compute_comparison()
     run_weight_only_int8()
     run_w8a8_int8()
+    
+    # Per-token quantization and large batch tests
+    run_per_token_quantization()
+    run_large_batch_matmul()
+    
     run_long_sequence_summary()
     test_quantization_error()
     
@@ -628,29 +775,40 @@ if __name__ == "__main__":
    - 大矩阵: 可能有加速 (计算密集型)
    - L20 的 FP16 Tensor Core 非常快
 
-2. 量化/反量化开销:
+2. Per-Token vs Per-Tensor 量化:
+   - Per-Token (KIVI Value): 每个 token 一个 scale，精度更高
+   - Per-Tensor: 整个张量一个 scale，开销更小
+   - Per-Token 量化开销稍大，但大矩阵时可忽略
+   - KIVI 对 Value 使用 Per-Token，对 Key 使用 Per-Channel
+
+3. 量化/反量化开销:
    - torch 手动量化: ~0.01-0.1ms
    - 反量化: ~0.005-0.05ms
    - 比 bitsandbytes 快 5-10x
 
-3. 端到端 W8A8:
-   - 需要: 量化激活 + int_mm + 反量化结果
-   - 开销往往抵消计算节省
-   - 只有超大矩阵才可能有加速
+4. 大 Batch Size 影响:
+   - Batch 增大 -> 计算量增大 -> 固定开销占比降低
+   - Batch >= 4 且 seq_len >= 8K 时，INT8 可能有优势
+   - 超大 Batch (16+) 时加速效果更明显
 
-4. Weight-Only INT8:
+5. 端到端 W8A8 (Per-Token):
+   - 需要: 量化激活 (per-token) + int_mm + 反量化结果
+   - 大 batch + 长序列时可能有加速
+   - 小矩阵时开销抵消计算节省
+
+6. Weight-Only INT8:
    - 最实用的方案
    - 节省 50% 权重显存
    - 开销小于 W8A8
 
-5. 长序列 (8K, 16K, 24K):
+7. 长序列 + 大 Batch (8K+, B4+):
    - 计算量大，固定开销占比小
    - int_mm 可能开始有优势
-   - V recon (K=256) 仍受限于小矩阵
+   - B4 x 8K, B8 x 8K 是较好的测试点
 
-6. 建议:
-   - 短序列/小矩阵: 使用 FP16
+8. 建议:
+   - 短序列/小 batch: 使用 FP16
    - 显存受限: 使用 Weight-Only INT8
-   - 长序列/大矩阵: 可测试 W8A8
+   - 长序列/大 batch: 可测试 W8A8 Per-Token
    - L20 考虑 FP8 (原生支持)
     """)
