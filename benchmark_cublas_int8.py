@@ -539,36 +539,35 @@ def run_per_token_quantization_benchmark():
     # Test configurations: (batch_size, seq_len, hidden_dim, description)
     # Value shape is typically (batch, seq_len, hidden_dim)
     configs = [
-        # Single batch, various sequence lengths
-        (1, 128, 1024, "B1 x 128 x 1024"),
+        # Small batch, various sequence lengths
         (1, 512, 1024, "B1 x 512 x 1024"),
-        (1, 2048, 1024, "B1 x 2048 x 1024"),
+        (1, 2048, 1024, "B1 x 2K x 1024"),
         (1, 8192, 1024, "B1 x 8K x 1024"),
-        (1, 16384, 1024, "B1 x 16K x 1024"),
-        (1, 24576, 1024, "B1 x 24K x 1024"),
         
-        # Large batch sizes
-        (4, 512, 1024, "B4 x 512 x 1024"),
-        (8, 512, 1024, "B8 x 512 x 1024"),
-        (16, 512, 1024, "B16 x 512 x 1024"),
-        (32, 512, 1024, "B32 x 512 x 1024"),
+        # Medium batch sizes
+        (8, 256, 1024, "B8 x 256 x 1024"),
+        (16, 256, 1024, "B16 x 256 x 1024"),
+        (32, 256, 1024, "B32 x 256 x 1024"),
         
-        (4, 2048, 1024, "B4 x 2K x 1024"),
-        (8, 2048, 1024, "B8 x 2K x 1024"),
-        (16, 2048, 1024, "B16 x 2K x 1024"),
+        # Large batch sizes (shorter sequences)
+        (64, 128, 1024, "B64 x 128 x 1024"),
+        (64, 256, 1024, "B64 x 256 x 1024"),
+        (64, 512, 1024, "B64 x 512 x 1024"),
         
-        # Very large batch with long sequence
-        (4, 8192, 1024, "B4 x 8K x 1024"),
-        (8, 8192, 1024, "B8 x 8K x 1024"),
+        (128, 64, 1024, "B128 x 64 x 1024"),
+        (128, 128, 1024, "B128 x 128 x 1024"),
+        (128, 256, 1024, "B128 x 256 x 1024"),
         
-        # Value reconstruction specific (rank -> hidden)
-        (1, 8192, 256, "V: B1 x 8K x 256"),
-        (4, 8192, 256, "V: B4 x 8K x 256"),
-        (8, 8192, 256, "V: B8 x 8K x 256"),
-        (1, 16384, 256, "V: B1 x 16K x 256"),
-        (4, 16384, 256, "V: B4 x 16K x 256"),
-        (1, 24576, 256, "V: B1 x 24K x 256"),
-        (4, 24576, 256, "V: B4 x 24K x 256"),
+        # Very large batch
+        (256, 64, 1024, "B256 x 64 x 1024"),
+        (256, 128, 1024, "B256 x 128 x 1024"),
+        
+        # Value reconstruction (rank -> hidden)
+        (64, 128, 256, "V: B64 x 128 x 256"),
+        (64, 256, 256, "V: B64 x 256 x 256"),
+        (128, 128, 256, "V: B128 x 128 x 256"),
+        (128, 256, 256, "V: B128 x 256 x 256"),
+        (256, 128, 256, "V: B256 x 128 x 256"),
     ]
     
     print(f"\n{'Config':<25} {'Per-Tensor Q':<12} {'Per-Token Q':<12} {'Diff':<10} {'Elements':<12}")
@@ -626,33 +625,38 @@ def run_per_token_matmul_benchmark():
     
     configs = [
         # (batch_size, seq_len, rank, hidden_dim, description)
-        # Single batch
-        (1, 512, 256, 1024, "B1 x 512, 256->1024"),
+        # Small batch, long sequence
         (1, 2048, 256, 1024, "B1 x 2K, 256->1024"),
         (1, 8192, 256, 1024, "B1 x 8K, 256->1024"),
-        (1, 16384, 256, 1024, "B1 x 16K, 256->1024"),
-        (1, 24576, 256, 1024, "B1 x 24K, 256->1024"),
         
-        # Large batch sizes
-        (4, 512, 256, 1024, "B4 x 512, 256->1024"),
-        (8, 512, 256, 1024, "B8 x 512, 256->1024"),
-        (16, 512, 256, 1024, "B16 x 512, 256->1024"),
+        # Medium batch
+        (8, 256, 256, 1024, "B8 x 256, 256->1024"),
+        (16, 256, 256, 1024, "B16 x 256, 256->1024"),
+        (32, 256, 256, 1024, "B32 x 256, 256->1024"),
+        
+        # Large batch, short sequence
+        (64, 64, 256, 1024, "B64 x 64, 256->1024"),
+        (64, 128, 256, 1024, "B64 x 128, 256->1024"),
+        (64, 256, 256, 1024, "B64 x 256, 256->1024"),
+        (64, 512, 256, 1024, "B64 x 512, 256->1024"),
+        
+        (128, 64, 256, 1024, "B128 x 64, 256->1024"),
+        (128, 128, 256, 1024, "B128 x 128, 256->1024"),
+        (128, 256, 256, 1024, "B128 x 256, 256->1024"),
+        
+        # Very large batch
+        (256, 64, 256, 1024, "B256 x 64, 256->1024"),
+        (256, 128, 256, 1024, "B256 x 128, 256->1024"),
+        
+        # Large batch with larger dimensions
+        (64, 128, 512, 4096, "B64 x 128, 512->4096"),
+        (128, 128, 512, 4096, "B128 x 128, 512->4096"),
+        (64, 256, 512, 4096, "B64 x 256, 512->4096"),
+        
+        # Mixed: medium batch, medium seq
         (32, 512, 256, 1024, "B32 x 512, 256->1024"),
-        
-        (4, 2048, 256, 1024, "B4 x 2K, 256->1024"),
-        (8, 2048, 256, 1024, "B8 x 2K, 256->1024"),
-        (16, 2048, 256, 1024, "B16 x 2K, 256->1024"),
-        
-        # Large batch with long sequence
-        (4, 8192, 256, 1024, "B4 x 8K, 256->1024"),
-        (8, 8192, 256, 1024, "B8 x 8K, 256->1024"),
-        (4, 16384, 256, 1024, "B4 x 16K, 256->1024"),
-        (4, 24576, 256, 1024, "B4 x 24K, 256->1024"),
-        
-        # Larger hidden dim
-        (1, 8192, 512, 4096, "B1 x 8K, 512->4096"),
-        (4, 8192, 512, 4096, "B4 x 8K, 512->4096"),
-        (1, 16384, 512, 4096, "B1 x 16K, 512->4096"),
+        (32, 1024, 256, 1024, "B32 x 1K, 256->1024"),
+        (64, 512, 256, 1024, "B64 x 512, 256->1024"),
     ]
     
     print(f"\n{'Config':<25} {'FP16':<10} {'INT8 PT':<10} {'INT8 Full':<10} {'W-Only':<10} {'INT8 Spd':<10}")
@@ -728,17 +732,17 @@ def run_large_batch_comparison():
     print("=" * 80)
     
     device = 'cuda'
-    
-    # Fixed sequence length and dimensions, vary batch size
-    seq_len = 2048
     rank = 256
     hidden_dim = 1024
     
-    batch_sizes = [1, 2, 4, 8, 16, 32, 64]
-    
-    print(f"\nFixed: seq_len={seq_len}, rank={rank}, hidden_dim={hidden_dim}")
+    # Test 1: Very large batch with short sequence
+    print(f"\n=== Test 1: Varying Batch Size (seq_len=128) ===")
+    print(f"Fixed: seq_len=128, rank={rank}, hidden_dim={hidden_dim}")
     print(f"\n{'Batch':<10} {'Total Tokens':<15} {'FP16 (ms)':<12} {'INT8 (ms)':<12} {'Full INT8':<12} {'Speedup':<10}")
     print("-" * 75)
+    
+    seq_len = 128
+    batch_sizes = [1, 4, 8, 16, 32, 64, 128, 256, 512]
     
     for batch in batch_sizes:
         try:
@@ -784,13 +788,61 @@ def run_large_batch_comparison():
         except Exception as e:
             print(f"{batch:<10} ERROR: {e}")
     
-    # Now vary sequence length with fixed batch
-    print(f"\n\nFixed: batch=4, rank={rank}, hidden_dim={hidden_dim}")
+    # Test 2: Large batch with medium sequence
+    print(f"\n=== Test 2: Varying Batch Size (seq_len=256) ===")
+    print(f"Fixed: seq_len=256, rank={rank}, hidden_dim={hidden_dim}")
+    print(f"\n{'Batch':<10} {'Total Tokens':<15} {'FP16 (ms)':<12} {'INT8 (ms)':<12} {'Full INT8':<12} {'Speedup':<10}")
+    print("-" * 75)
+    
+    seq_len = 256
+    batch_sizes = [1, 4, 8, 16, 32, 64, 128, 256]
+    
+    for batch in batch_sizes:
+        try:
+            M = batch * seq_len
+            K = rank
+            N = hidden_dim
+            
+            A = torch.randn(M, K, dtype=torch.float16, device=device)
+            W = torch.randn(K, N, dtype=torch.float16, device=device)
+            
+            A_scale = A.abs().amax(dim=-1, keepdim=True) / 127.0 + 1e-6
+            A_int8 = (A / A_scale).round().clamp(-128, 127).to(torch.int8)
+            W_scale = W.abs().amax() / 127.0 + 1e-6
+            W_int8 = (W / W_scale).round().clamp(-128, 127).to(torch.int8)
+            
+            fp16_time = benchmark_func(lambda: torch.matmul(A, W), num_warmup=10, num_runs=50)
+            int8_time = benchmark_func(lambda: torch._int_mm(A_int8, W_int8), num_warmup=10, num_runs=50)
+            
+            def int8_full():
+                a_s = A.abs().amax(dim=-1, keepdim=True) / 127.0 + 1e-6
+                a_i = (A / a_s).round().clamp(-128, 127).to(torch.int8)
+                c = torch._int_mm(a_i, W_int8)
+                return c.half() * a_s * W_scale
+            
+            full_time = benchmark_func(int8_full, num_warmup=10, num_runs=50)
+            speedup = fp16_time / int8_time
+            total_tokens = batch * seq_len
+            
+            print(f"{batch:<10} {total_tokens:<15} {fp16_time:<12.4f} {int8_time:<12.4f} {full_time:<12.4f} {speedup:<10.2f}x")
+            
+            del A, W, A_int8, W_int8
+            torch.cuda.empty_cache()
+            
+        except torch.cuda.OutOfMemoryError:
+            print(f"{batch:<10} OOM")
+            torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"{batch:<10} ERROR: {e}")
+    
+    # Test 3: Fixed large batch, vary sequence length
+    print(f"\n=== Test 3: Varying Seq Len (batch=64) ===")
+    print(f"Fixed: batch=64, rank={rank}, hidden_dim={hidden_dim}")
     print(f"\n{'Seq Len':<10} {'Total Tokens':<15} {'FP16 (ms)':<12} {'INT8 (ms)':<12} {'Full INT8':<12} {'Speedup':<10}")
     print("-" * 75)
     
-    batch = 4
-    seq_lengths = [512, 1024, 2048, 4096, 8192, 16384, 24576, 32768]
+    batch = 64
+    seq_lengths = [64, 128, 256, 512, 1024, 2048]
     
     for seq_len in seq_lengths:
         try:
@@ -801,19 +853,14 @@ def run_large_batch_comparison():
             A = torch.randn(M, K, dtype=torch.float16, device=device)
             W = torch.randn(K, N, dtype=torch.float16, device=device)
             
-            # Pre-quantize
             A_scale = A.abs().amax(dim=-1, keepdim=True) / 127.0 + 1e-6
             A_int8 = (A / A_scale).round().clamp(-128, 127).to(torch.int8)
             W_scale = W.abs().amax() / 127.0 + 1e-6
             W_int8 = (W / W_scale).round().clamp(-128, 127).to(torch.int8)
             
-            # FP16
             fp16_time = benchmark_func(lambda: torch.matmul(A, W), num_warmup=10, num_runs=50)
-            
-            # INT8 only
             int8_time = benchmark_func(lambda: torch._int_mm(A_int8, W_int8), num_warmup=10, num_runs=50)
             
-            # Full INT8
             def int8_full():
                 a_s = A.abs().amax(dim=-1, keepdim=True) / 127.0 + 1e-6
                 a_i = (A / a_s).round().clamp(-128, 127).to(torch.int8)
@@ -821,7 +868,53 @@ def run_large_batch_comparison():
                 return c.half() * a_s * W_scale
             
             full_time = benchmark_func(int8_full, num_warmup=10, num_runs=50)
+            speedup = fp16_time / int8_time
+            total_tokens = batch * seq_len
             
+            print(f"{seq_len:<10} {total_tokens:<15} {fp16_time:<12.4f} {int8_time:<12.4f} {full_time:<12.4f} {speedup:<10.2f}x")
+            
+            del A, W, A_int8, W_int8
+            torch.cuda.empty_cache()
+            
+        except torch.cuda.OutOfMemoryError:
+            print(f"{seq_len:<10} OOM")
+            torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"{seq_len:<10} ERROR: {e}")
+    
+    # Test 4: Fixed very large batch, vary sequence length
+    print(f"\n=== Test 4: Varying Seq Len (batch=128) ===")
+    print(f"Fixed: batch=128, rank={rank}, hidden_dim={hidden_dim}")
+    print(f"\n{'Seq Len':<10} {'Total Tokens':<15} {'FP16 (ms)':<12} {'INT8 (ms)':<12} {'Full INT8':<12} {'Speedup':<10}")
+    print("-" * 75)
+    
+    batch = 128
+    seq_lengths = [64, 128, 256, 512, 1024]
+    
+    for seq_len in seq_lengths:
+        try:
+            M = batch * seq_len
+            K = rank
+            N = hidden_dim
+            
+            A = torch.randn(M, K, dtype=torch.float16, device=device)
+            W = torch.randn(K, N, dtype=torch.float16, device=device)
+            
+            A_scale = A.abs().amax(dim=-1, keepdim=True) / 127.0 + 1e-6
+            A_int8 = (A / A_scale).round().clamp(-128, 127).to(torch.int8)
+            W_scale = W.abs().amax() / 127.0 + 1e-6
+            W_int8 = (W / W_scale).round().clamp(-128, 127).to(torch.int8)
+            
+            fp16_time = benchmark_func(lambda: torch.matmul(A, W), num_warmup=10, num_runs=50)
+            int8_time = benchmark_func(lambda: torch._int_mm(A_int8, W_int8), num_warmup=10, num_runs=50)
+            
+            def int8_full():
+                a_s = A.abs().amax(dim=-1, keepdim=True) / 127.0 + 1e-6
+                a_i = (A / a_s).round().clamp(-128, 127).to(torch.int8)
+                c = torch._int_mm(a_i, W_int8)
+                return c.half() * a_s * W_scale
+            
+            full_time = benchmark_func(int8_full, num_warmup=10, num_runs=50)
             speedup = fp16_time / int8_time
             total_tokens = batch * seq_len
             
