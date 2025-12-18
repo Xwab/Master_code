@@ -179,7 +179,7 @@ def benchmark_prefill(model, input_ids: torch.Tensor, warmup: int = 3, num_runs:
 def benchmark_decode(model, input_ids: torch.Tensor, num_new_tokens: int = 32,
                      warmup: int = 2, num_runs: int = 5) -> Dict:
     """
-    测试 decode 阶段的延时
+    测试 decode 阶段的延时 (标准 HuggingFace 模型)
     
     Args:
         model: 模型
@@ -254,10 +254,194 @@ def benchmark_decode(model, input_ids: torch.Tensor, num_new_tokens: int = 32,
     }
 
 
+def benchmark_decode_kivi(model, input_ids: torch.Tensor, num_new_tokens: int = 32,
+                          warmup: int = 2, num_runs: int = 5) -> Dict:
+    """
+    测试 decode 阶段的延时 (KIVI 等自管理 KV cache 的模型)
+    
+    对于 KIVI 模型，不显式传递 past_key_values，让模型自己管理 cache
+    
+    Args:
+        model: 模型
+        input_ids: 输入 token ids, shape: (1, seq_len)
+        num_new_tokens: 生成的新 token 数
+        warmup: 预热次数
+        num_runs: 测试次数
+    
+    Returns:
+        包含延时统计的字典
+    """
+    device = input_ids.device
+    vocab_size = model.config.vocab_size
+    seq_len = input_ids.shape[1]
+    
+    # Warmup
+    with torch.no_grad():
+        for _ in range(warmup):
+            # Prefill - 让模型自己初始化 cache
+            outputs = model(input_ids, use_cache=True)
+            past_key_values = outputs.past_key_values
+            
+            next_token = torch.randint(0, vocab_size, (1, 1), device=device)
+            for _ in range(num_new_tokens):
+                outputs = model(next_token, use_cache=True, past_key_values=past_key_values)
+                past_key_values = outputs.past_key_values
+                next_token = torch.randint(0, vocab_size, (1, 1), device=device)
+            
+            # 清理模型内部 cache (如果有的话)
+            if hasattr(model, 'clear_cache'):
+                model.clear_cache()
+            elif hasattr(model, 'reset_cache'):
+                model.reset_cache()
+    
+    # Benchmark
+    all_token_times = []
+    with torch.no_grad():
+        for _ in range(num_runs):
+            # Prefill - 让模型自己初始化 cache
+            outputs = model(input_ids, use_cache=True)
+            past_key_values = outputs.past_key_values
+            
+            next_token = torch.randint(0, vocab_size, (1, 1), device=device)
+            
+            # 测量 decode
+            token_times = []
+            for _ in range(num_new_tokens):
+                torch.cuda.synchronize()
+                start = time.perf_counter()
+                
+                outputs = model(next_token, use_cache=True, past_key_values=past_key_values)
+                
+                torch.cuda.synchronize()
+                end = time.perf_counter()
+                
+                past_key_values = outputs.past_key_values
+                next_token = torch.randint(0, vocab_size, (1, 1), device=device)
+                token_times.append((end - start) * 1000)  # ms
+            
+            all_token_times.extend(token_times)
+            
+            # 清理模型内部 cache
+            if hasattr(model, 'clear_cache'):
+                model.clear_cache()
+            elif hasattr(model, 'reset_cache'):
+                model.reset_cache()
+    
+    # 统计
+    times = sorted(all_token_times)
+    avg_time = sum(times) / len(times)
+    min_time = times[0]
+    max_time = times[-1]
+    median_time = times[len(times) // 2]
+    
+    # 吞吐量
+    throughput = 1000 / avg_time  # tokens/s
+    
+    return {
+        'avg_ms': avg_time,
+        'min_ms': min_time,
+        'max_ms': max_time,
+        'median_ms': median_time,
+        'throughput': throughput,  # tokens/s
+    }
+
+
+def benchmark_decode_generate(model, input_ids: torch.Tensor, num_new_tokens: int = 32,
+                               warmup: int = 2, num_runs: int = 5) -> Dict:
+    """
+    测试 decode 阶段的延时 (使用 model.generate)
+    
+    这种方式最通用，适用于所有类型的模型，包括 KIVI
+    模型内部会自己管理 KV cache
+    
+    Args:
+        model: 模型
+        input_ids: 输入 token ids, shape: (1, seq_len)
+        num_new_tokens: 生成的新 token 数
+        warmup: 预热次数
+        num_runs: 测试次数
+    
+    Returns:
+        包含延时统计的字典
+    """
+    seq_len = input_ids.shape[1]
+    
+    # 设置生成参数
+    gen_kwargs = {
+        'max_new_tokens': num_new_tokens,
+        'do_sample': False,  # greedy for consistency
+        'use_cache': True,
+        'pad_token_id': model.config.pad_token_id or model.config.eos_token_id,
+    }
+    
+    # Warmup
+    with torch.no_grad():
+        for _ in range(warmup):
+            _ = model.generate(input_ids, **gen_kwargs)
+            # 清理 cache
+            if hasattr(model, 'clear_cache'):
+                model.clear_cache()
+            elif hasattr(model, 'reset_cache'):
+                model.reset_cache()
+    
+    # Benchmark
+    total_times = []
+    with torch.no_grad():
+        for _ in range(num_runs):
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            
+            outputs = model.generate(input_ids, **gen_kwargs)
+            
+            torch.cuda.synchronize()
+            end = time.perf_counter()
+            
+            total_time = (end - start) * 1000  # ms
+            total_times.append(total_time)
+            
+            # 清理 cache
+            if hasattr(model, 'clear_cache'):
+                model.clear_cache()
+            elif hasattr(model, 'reset_cache'):
+                model.reset_cache()
+    
+    # 计算每个 token 的平均时间
+    # 总时间包括 prefill + decode，这里我们近似估计 decode 时间
+    # 假设 prefill 时间可以忽略（实际上对于长序列不能忽略）
+    avg_total = sum(total_times) / len(total_times)
+    avg_per_token = avg_total / num_new_tokens
+    
+    times_per_token = [t / num_new_tokens for t in total_times]
+    times_per_token = sorted(times_per_token)
+    
+    return {
+        'avg_ms': avg_per_token,
+        'min_ms': times_per_token[0],
+        'max_ms': times_per_token[-1],
+        'median_ms': times_per_token[len(times_per_token) // 2],
+        'throughput': 1000 / avg_per_token,  # tokens/s
+        'total_time_ms': avg_total,
+        'note': 'includes prefill time',
+    }
+
+
 def run_benchmark_for_model(model, tokenizer, seq_lens: List[int], 
-                            decode_tokens: int = 32, device: str = "cuda") -> List[Dict]:
+                            decode_tokens: int = 32, device: str = "cuda",
+                            decode_mode: str = "auto") -> List[Dict]:
     """
     对一个模型运行所有序列长度的 benchmark
+    
+    Args:
+        model: 模型
+        tokenizer: tokenizer
+        seq_lens: 要测试的序列长度列表
+        decode_tokens: decode 阶段生成的 token 数
+        device: 设备
+        decode_mode: decode 测试模式
+            - "standard": 使用 DynamicCache (标准 HuggingFace 模型)
+            - "kivi": 不显式传递 past_key_values (KIVI 等自管理 cache 的模型)
+            - "generate": 使用 model.generate (最通用)
+            - "auto": 自动检测
     
     Returns:
         结果列表
@@ -265,6 +449,35 @@ def run_benchmark_for_model(model, tokenizer, seq_lens: List[int],
     results = []
     vocab_size = model.config.vocab_size
     max_pos = getattr(model.config, 'max_position_embeddings', 32768)
+    
+    # 自动检测 decode 模式
+    if decode_mode == "auto":
+        # 检查是否是 KIVI 或其他自定义模型
+        model_type = getattr(model.config, 'model_type', '')
+        
+        # 检查模型是否有自定义的 cache 管理
+        has_custom_cache = (
+            hasattr(model, 'clear_cache') or 
+            hasattr(model, 'reset_cache') or
+            hasattr(model, 'kv_cache') or
+            'kivi' in model_type.lower() or
+            'kivi' in str(type(model)).lower()
+        )
+        
+        if has_custom_cache:
+            decode_mode = "kivi"
+            print(f"  [Auto-detected: KIVI/custom cache mode]")
+        else:
+            decode_mode = "standard"
+    
+    # 选择 decode 函数
+    decode_fn_map = {
+        "standard": benchmark_decode,
+        "kivi": benchmark_decode_kivi,
+        "generate": benchmark_decode_generate,
+    }
+    decode_fn = decode_fn_map.get(decode_mode, benchmark_decode_kivi)
+    print(f"  Using decode mode: {decode_mode}")
     
     for seq_len in seq_lens:
         print(f"\n  Testing seq_len = {seq_len}...", end=" ", flush=True)
@@ -287,7 +500,7 @@ def run_benchmark_for_model(model, tokenizer, seq_lens: List[int],
             prefill_result = benchmark_prefill(model, input_ids)
             
             # 测试 decode
-            decode_result = benchmark_decode(model, input_ids, num_new_tokens=decode_tokens)
+            decode_result = decode_fn(model, input_ids, num_new_tokens=decode_tokens)
             
             # 获取内存使用
             mem = get_gpu_memory_info()
@@ -298,6 +511,7 @@ def run_benchmark_for_model(model, tokenizer, seq_lens: List[int],
                 'prefill': prefill_result,
                 'decode': decode_result,
                 'memory_gb': mem['max_allocated'] if mem else None,
+                'decode_mode': decode_mode,
             }
             results.append(result)
             
@@ -307,6 +521,12 @@ def run_benchmark_for_model(model, tokenizer, seq_lens: List[int],
             # 清理
             del input_ids
             clear_gpu_memory()
+            
+            # 清理模型 cache
+            if hasattr(model, 'clear_cache'):
+                model.clear_cache()
+            elif hasattr(model, 'reset_cache'):
+                model.reset_cache()
             
         except torch.cuda.OutOfMemoryError:
             print("OOM!")
@@ -318,6 +538,8 @@ def run_benchmark_for_model(model, tokenizer, seq_lens: List[int],
             
         except Exception as e:
             print(f"Error: {e}")
+            import traceback
+            traceback.print_exc()
             results.append({
                 'seq_len': seq_len,
                 'status': 'error',
@@ -393,6 +615,10 @@ def main():
                         help='Sequence lengths to test, comma-separated (default: 512,1024,2048,4096,8192,16384,32768)')
     parser.add_argument('--decode_tokens', type=int, default=32,
                         help='Number of tokens to generate in decode phase (default: 32)')
+    parser.add_argument('--decode_mode', type=str, default='auto',
+                        choices=['auto', 'standard', 'kivi', 'generate'],
+                        help='Decode test mode: auto (detect), standard (DynamicCache), '
+                             'kivi (self-managed cache), generate (use model.generate)')
     parser.add_argument('--dtype', type=str, default='float16', choices=['float16', 'bfloat16', 'float32'],
                         help='Data type (default: float16)')
     parser.add_argument('--no_flash_attn', action='store_true',
@@ -428,6 +654,7 @@ def main():
     print(f"Models: {model_paths}")
     print(f"Sequence lengths: {seq_lens}")
     print(f"Decode tokens: {args.decode_tokens}")
+    print(f"Decode mode: {args.decode_mode}")
     print(f"Dtype: {args.dtype}")
     print(f"Flash Attention: {not args.no_flash_attn}")
     print()
@@ -439,6 +666,7 @@ def main():
         'config': {
             'seq_lens': seq_lens,
             'decode_tokens': args.decode_tokens,
+            'decode_mode': args.decode_mode,
             'dtype': args.dtype,
             'flash_attn': not args.no_flash_attn,
         },
@@ -465,7 +693,8 @@ def main():
             results = run_benchmark_for_model(
                 model, tokenizer, seq_lens, 
                 decode_tokens=args.decode_tokens,
-                device=args.device
+                device=args.device,
+                decode_mode=args.decode_mode
             )
             
             # 打印结果
