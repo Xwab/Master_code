@@ -121,14 +121,16 @@ def int8_matmul_torch(x_int8: torch.Tensor, w_int8: torch.Tensor,
 def int8_matmul_fallback(x_int8: torch.Tensor, w_int8: torch.Tensor,
                           x_scale: torch.Tensor, w_scale: torch.Tensor) -> torch.Tensor:
     """
-    Fallback: 使用 INT32 模拟 (无速度提升)
+    Fallback: 使用 float32 模拟 (无速度提升)
     仅用于精度测试或不支持 INT8 kernel 的设备
-    """
-    # 转为 int32 计算
-    out_int32 = torch.matmul(x_int8.int(), w_int8.T.int())
     
-    # 反量化
-    out = out_int32.float() * x_scale * w_scale.T
+    注意: CUDA 不支持 int32 matmul，所以必须转为 float!
+    """
+    # 转为 float32 计算 (CUDA 不支持 int32 matmul)
+    out_float = torch.matmul(x_int8.float(), w_int8.T.float())
+    
+    # 应用缩放因子
+    out = out_float * x_scale * w_scale.T
     return out
 
 
