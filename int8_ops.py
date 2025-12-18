@@ -203,12 +203,25 @@ class INT8LinearWithPrequantizedWeight(nn.Module):
 
 # 检查 Triton 是否可用
 TRITON_AVAILABLE = False
+TRITON_ERROR = None
 try:
     import triton
     import triton.language as tl
+    # 测试基本功能
+    _ = tl.constexpr
     TRITON_AVAILABLE = True
-except ImportError:
-    pass
+except ImportError as e:
+    TRITON_ERROR = f"ImportError: {e}"
+except Exception as e:
+    TRITON_ERROR = f"Error: {e}"
+
+def get_triton_status():
+    """获取 Triton 状态"""
+    return {
+        'available': TRITON_AVAILABLE,
+        'error': TRITON_ERROR,
+        'version': getattr(triton, '__version__', 'unknown') if TRITON_AVAILABLE else None
+    }
 
 
 if TRITON_AVAILABLE:
@@ -236,9 +249,9 @@ if TRITON_AVAILABLE:
         amax = tl.maximum(amax, 1e-8)
         scale = amax / 127.0
         
-        # 量化
+        # 量化 (使用 floor(x + 0.5) 代替 rint)
         x_scaled = x / scale
-        x_int8 = tl.libdevice.rint(x_scaled)
+        x_int8 = tl.floor(x_scaled + 0.5)  # 四舍五入
         x_int8 = tl.minimum(tl.maximum(x_int8, -128.0), 127.0)
         
         # 存储
@@ -455,6 +468,13 @@ class INT8LinearFunction:
 # 5. 便捷模块
 # ============================================================================
 
+def disable_triton():
+    """禁用 Triton (如果有兼容性问题)"""
+    global TRITON_AVAILABLE
+    TRITON_AVAILABLE = False
+    print("Triton disabled. Using torch backend.")
+
+
 class INT8Linear(nn.Module):
     """
     完整的 INT8 线性层
@@ -462,6 +482,10 @@ class INT8Linear(nn.Module):
     使用方法:
         layer = INT8Linear(weight, bias)
         output = layer(input)
+    
+    如果 Triton 有问题，可以禁用:
+        from int8_ops import disable_triton
+        disable_triton()
     """
     
     def __init__(
