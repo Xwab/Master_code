@@ -38,6 +38,29 @@ def check_backends():
     return has_int_mm, has_bnb, bnb
 
 
+def create_bnb_linear(in_features: int, out_features: int, weight: torch.Tensor, device: str = "cuda"):
+    """创建 bitsandbytes 的 8-bit Linear 层"""
+    import bitsandbytes as bnb
+    
+    # 创建 Linear8bitLt 层
+    linear = bnb.nn.Linear8bitLt(
+        in_features, 
+        out_features, 
+        bias=False,
+        has_fp16_weights=False,
+        threshold=0.0,  # 不使用混合精度阈值
+    )
+    
+    # 复制权重并移动到 CUDA（触发量化）
+    linear.weight = bnb.nn.Int8Params(
+        weight.to(device).contiguous(),
+        requires_grad=False,
+        has_fp16_weights=False,
+    )
+    
+    return linear.to(device)
+
+
 @torch.no_grad()
 def quantize_int8_symmetric(x: torch.Tensor, dim: int = -1) -> Tuple[torch.Tensor, torch.Tensor]:
     """对称 INT8 量化"""
@@ -78,20 +101,29 @@ def test_performance(M: int, K: int, N: int, has_int_mm: bool, has_bnb: bool, bn
     
     results = {}
     
-    # 1. FP16 baseline
+    # 1. FP16 baseline (使用 nn.Linear)
+    fp16_linear = torch.nn.Linear(K, N, bias=False).to(device, dtype)
+    fp16_linear.weight.data.copy_(w)
+    
     def fp16_matmul():
-        return torch.matmul(x, w.T)
+        return fp16_linear(x)
     
     fp16_time = benchmark_fn(fp16_matmul)
     results['FP16'] = fp16_time
-    print(f"FP16 matmul: {fp16_time:.4f} ms")
+    print(f"FP16 Linear: {fp16_time:.4f} ms")
     
-    # 2. bitsandbytes
+    # 2. bitsandbytes Linear8bitLt
     if has_bnb:
-        def bnb_matmul():
-            return bnb.matmul(x, w.T)
-        
         try:
+            bnb_linear = create_bnb_linear(K, N, w, device)
+            
+            # warmup 让 bitsandbytes 完成内部量化
+            with torch.no_grad():
+                _ = bnb_linear(x)
+            
+            def bnb_matmul():
+                return bnb_linear(x)
+            
             bnb_time = benchmark_fn(bnb_matmul)
             results['bnb'] = bnb_time
             speedup = fp16_time / bnb_time

@@ -28,9 +28,11 @@ logger = logging.get_logger(__name__)
 
 # 检查 bitsandbytes
 BNB_AVAILABLE = False
+bnb = None
 try:
-    import bitsandbytes as bnb
-    from bitsandbytes.nn import Linear8bitLt
+    import bitsandbytes as bnb_module
+    bnb = bnb_module
+    from bitsandbytes.nn import Linear8bitLt, Int8Params
     BNB_AVAILABLE = True
 except ImportError:
     pass
@@ -84,18 +86,41 @@ def quantize_to_int8_symmetric(x, dim=-1):
 # INT8 矩阵乘法实现
 # ============================================================================
 
-def int8_matmul_bnb(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None):
+def create_bnb_linear(in_features: int, out_features: int, weight: torch.Tensor, 
+                       bias: Optional[torch.Tensor] = None, device: str = "cuda"):
     """
-    使用 bitsandbytes 的 INT8 矩阵乘法
+    创建 bitsandbytes 的 8-bit Linear 层
     
-    bitsandbytes 会自动处理量化和反量化
+    Args:
+        in_features: 输入维度
+        out_features: 输出维度
+        weight: 权重张量 (out_features, in_features)
+        bias: 偏置张量 (out_features,)
+        device: 设备
     """
-    # bitsandbytes 的 matmul_4bit/matmul 会自动处理
-    # 这里我们使用 bnb.matmul 进行 8-bit 矩阵乘法
-    out = bnb.matmul(x, weight.T)
-    if bias is not None:
-        out = out + bias
-    return out
+    has_bias = bias is not None
+    
+    # 创建 Linear8bitLt 层
+    linear = bnb.nn.Linear8bitLt(
+        in_features, 
+        out_features, 
+        bias=has_bias,
+        has_fp16_weights=False,
+        threshold=0.0,  # 不使用混合精度阈值
+    )
+    
+    # 设置权重（触发量化）
+    linear.weight = bnb.nn.Int8Params(
+        weight.to(device).contiguous(),
+        requires_grad=False,
+        has_fp16_weights=False,
+    )
+    
+    # 设置偏置
+    if has_bias and bias is not None:
+        linear.bias = torch.nn.Parameter(bias.to(device).contiguous())
+    
+    return linear.to(device)
 
 
 def int8_matmul_torch(x_int8: torch.Tensor, w_int8: torch.Tensor,
@@ -145,12 +170,16 @@ class ALRDLinearINT8(nn.Module):
         self.out_features = out_features
         self.rank = rank
         self.backend = backend
+        self.has_bias = bias
         
         # 低秩投影 B
         self.BLinear = nn.Linear(in_features, rank, bias=False)
         
-        # 重建矩阵 A
+        # 重建矩阵 A (用于 FP16 和作为权重来源)
         self.ALinear = nn.Linear(rank, out_features, bias=bias)
+        
+        # bitsandbytes 8-bit 版本 (延迟初始化)
+        self.ALinear_bnb = None
         
         # Latent 量化器
         self.quantizer = Quantizer(n_bits=4, group_size=0, sym=True, clip_ratio=1.0)
@@ -174,15 +203,28 @@ class ALRDLinearINT8(nn.Module):
                 self.backend = "fallback"
     
     def prepare_int8_weights(self):
-        """预量化权重 (用于 torch._int_mm 和 fallback)"""
+        """预量化权重"""
         if self._int8_prepared:
             return
         
         with torch.no_grad():
-            w = self.ALinear.weight.data.float()
-            w_int8, w_scale = quantize_to_int8_symmetric(w, dim=-1)
-            self.A_int8 = w_int8.contiguous()
-            self.A_scale = w_scale.contiguous()
+            if self.backend == "bnb" and BNB_AVAILABLE:
+                # 创建 bitsandbytes 8-bit Linear
+                device = self.ALinear.weight.device
+                self.ALinear_bnb = create_bnb_linear(
+                    self.rank, 
+                    self.out_features,
+                    self.ALinear.weight.data,
+                    self.ALinear.bias if self.has_bias else None,
+                    device=str(device)
+                )
+            else:
+                # torch._int_mm 或 fallback
+                w = self.ALinear.weight.data.float()
+                w_int8, w_scale = quantize_to_int8_symmetric(w, dim=-1)
+                self.A_int8 = w_int8.contiguous()
+                self.A_scale = w_scale.contiguous()
+            
             self._int8_prepared = True
     
     def quantize_latent(self, latents):
@@ -194,16 +236,16 @@ class ALRDLinearINT8(nn.Module):
     def forward_int8(self, latent):
         """INT8 版本的重建"""
         
-        if self.backend == "bnb" and BNB_AVAILABLE:
-            # 使用 bitsandbytes
-            out = int8_matmul_bnb(latent, self.ALinear.weight, self.ALinear.bias)
+        if not self._int8_prepared:
+            self.prepare_int8_weights()
+        
+        if self.backend == "bnb" and BNB_AVAILABLE and self.ALinear_bnb is not None:
+            # 使用 bitsandbytes Linear8bitLt
+            out = self.ALinear_bnb(latent)
             return out.to(latent.dtype)
         
         elif self.backend == "torch" and TORCH_INT_MM_AVAILABLE:
             # 使用 torch._int_mm
-            if not self._int8_prepared:
-                self.prepare_int8_weights()
-            
             latent_int8, latent_scale = quantize_to_int8_symmetric(latent.float(), dim=-1)
             latent_int8 = latent_int8.contiguous()
             
@@ -215,17 +257,8 @@ class ALRDLinearINT8(nn.Module):
             return out.to(latent.dtype)
         
         else:
-            # Fallback
-            if not self._int8_prepared:
-                self.prepare_int8_weights()
-            
-            latent_int8, latent_scale = quantize_to_int8_symmetric(latent.float(), dim=-1)
-            out = int8_matmul_fallback(
-                latent_int8, self.A_int8,
-                latent_scale, self.A_scale,
-                self.ALinear.bias
-            )
-            return out.to(latent.dtype)
+            # Fallback: 使用 FP16
+            return self.ALinear(latent)
     
     def forward(self, x):
         """默认使用 FP16"""
