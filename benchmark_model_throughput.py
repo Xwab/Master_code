@@ -1,331 +1,430 @@
 """
-完整模型 Throughput 测试
+INT8 vs FP16 模型吞吐量对比 Benchmark
 
-对比 FP16 和 INT8 版本的低秩压缩模型:
-- Prefill throughput (tokens/s)
-- Decode throughput (tokens/s)
-- Latency (ms/token)
-- Memory usage
-
-支持从硬盘加载已有模型权重
+不需要本地模型，使用随机初始化的权重进行测试
+主要测试 Value 重建时使用 INT8 矩阵乘法的效果
 """
 
 import torch
 import torch.nn as nn
 import time
 import argparse
-import gc
-from tqdm import tqdm
-from typing import Optional, Dict, List
-from dataclasses import dataclass
-from transformers import AutoTokenizer, AutoConfig
-
-# 导入两个版本的模型加载函数
-from modeling_alrd_llama_fp16 import load_model_fp16
-from modeling_alrd_llama_int8 import load_model_int8, print_int8_support
+from typing import Optional, Tuple
 
 
-@dataclass
-class BenchmarkResult:
-    """Benchmark 结果"""
-    model_type: str
-    batch_size: int
-    prefill_len: int
-    decode_steps: int
-    prefill_time_ms: float
-    prefill_throughput: float
-    decode_time_ms: float
-    decode_throughput: float
-    avg_decode_latency_ms: float
-    peak_memory_gb: float
+# ============================================================================
+# 检测可用的 INT8 后端
+# ============================================================================
 
-
-def get_truncation_ranks(config, rank_ratio: float = 0.25) -> Dict[str, int]:
-    """
-    生成 truncation_ranks 字典
-    """
-    ranks = {}
-    num_layers = config.num_hidden_layers
-    kv_dim = config.num_key_value_heads * (config.hidden_size // config.num_attention_heads)
-    rank = int(kv_dim * rank_ratio)
+def check_int8_backends():
+    """检测可用的 INT8 后端"""
+    print("=" * 60)
+    print("INT8 Backend Detection")
+    print("=" * 60)
     
-    for i in range(num_layers):
-        ranks[f"model.layers.{i}.self_attn.k_proj"] = rank
-        ranks[f"model.layers.{i}.self_attn.v_proj"] = rank
-    
-    return ranks
-
-
-def warmup_model(model, input_ids, n_warmup: int = 3):
-    """预热模型"""
-    with torch.no_grad():
-        for _ in range(n_warmup):
-            _ = model(input_ids, use_cache=True)
-    torch.cuda.synchronize()
-
-
-def benchmark_prefill(model, input_ids: torch.Tensor, n_iter: int = 10) -> tuple:
-    """测试 Prefill 性能"""
-    batch_size, seq_len = input_ids.shape
-    
-    warmup_model(model, input_ids)
-    
-    times = []
-    with torch.no_grad():
-        for _ in range(n_iter):
-            torch.cuda.synchronize()
-            start = time.perf_counter()
-            _ = model(input_ids, use_cache=True)
-            torch.cuda.synchronize()
-            end = time.perf_counter()
-            times.append((end - start) * 1000)
-    
-    avg_time = sum(times) / len(times)
-    throughput = (batch_size * seq_len) / (avg_time / 1000)
-    
-    return avg_time, throughput
-
-
-def benchmark_decode(model, prefill_ids: torch.Tensor, decode_steps: int = 32, n_iter: int = 5) -> tuple:
-    """测试 Decode 性能"""
-    batch_size = prefill_ids.shape[0]
-    device = prefill_ids.device
-    
-    with torch.no_grad():
-        outputs = model(prefill_ids, use_cache=True)
-        past_key_values = outputs.past_key_values
-    
-    times = []
-    
-    with torch.no_grad():
-        for _ in range(n_iter):
-            outputs = model(prefill_ids, use_cache=True)
-            past_kv = outputs.past_key_values
-            
-            next_token = torch.randint(0, 32000, (batch_size, 1), device=device)
-            
-            torch.cuda.synchronize()
-            start = time.perf_counter()
-            
-            for step in range(decode_steps):
-                outputs = model(
-                    next_token,
-                    past_key_values=past_kv,
-                    use_cache=True
-                )
-                past_kv = outputs.past_key_values
-                next_token = outputs.logits[:, -1:, :].argmax(dim=-1)
-            
-            torch.cuda.synchronize()
-            end = time.perf_counter()
-            times.append((end - start) * 1000)
-    
-    avg_total_time = sum(times) / len(times)
-    throughput = (batch_size * decode_steps) / (avg_total_time / 1000)
-    avg_latency = avg_total_time / decode_steps
-    
-    return avg_total_time, throughput, avg_latency
-
-
-def get_peak_memory_gb() -> float:
-    """获取峰值显存使用量 (GB)"""
+    # PyTorch version
+    print(f"PyTorch version: {torch.__version__}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
-        return torch.cuda.max_memory_allocated() / (1024**3)
-    return 0.0
+        print(f"CUDA device: {torch.cuda.get_device_name()}")
+    
+    # torch._int_mm
+    has_int_mm = hasattr(torch, '_int_mm')
+    print(f"torch._int_mm: {has_int_mm}")
+    
+    # bitsandbytes
+    try:
+        import bitsandbytes as bnb
+        print(f"bitsandbytes: True (version {bnb.__version__})")
+        has_bnb = True
+    except ImportError:
+        print("bitsandbytes: False")
+        has_bnb = False
+    
+    # Triton
+    try:
+        import triton
+        print(f"Triton: True (version {triton.__version__})")
+        has_triton = True
+    except ImportError:
+        print("Triton: False")
+        has_triton = False
+    
+    print("=" * 60)
+    return {"int_mm": has_int_mm, "bnb": has_bnb, "triton": has_triton}
 
 
-def run_benchmark(args):
-    """运行完整 benchmark"""
+# ============================================================================
+# 量化工具
+# ============================================================================
+
+@torch.no_grad()
+def quantize_to_int8_symmetric(x: torch.Tensor, dim: int = -1) -> Tuple[torch.Tensor, torch.Tensor]:
+    """对称 INT8 量化"""
+    amax = x.abs().amax(dim=dim, keepdim=True).clamp(min=1e-8)
+    scale = amax / 127.0
+    x_int8 = (x / scale).round().clamp(-128, 127).to(torch.int8)
+    return x_int8, scale
+
+
+# ============================================================================
+# 低秩层实现
+# ============================================================================
+
+class ALRDLinearFP16(nn.Module):
+    """FP16 版本的低秩层"""
     
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
-    truncation_ranks = get_truncation_ranks(config, args.rank_ratio)
+    def __init__(self, in_features: int, out_features: int, rank: int, bias: bool = True):
+        super().__init__()
+        self.BLinear = nn.Linear(in_features, rank, bias=False)
+        self.ALinear = nn.Linear(rank, out_features, bias=bias)
     
-    batch_sizes = [int(x) for x in args.batch_sizes.split(',')]
-    prefill_lens = [int(x) for x in args.prefill_lens.split(',')]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        latent = self.BLinear(x)
+        return self.ALinear(latent)
+
+
+class ALRDLinearINT8(nn.Module):
+    """INT8 版本的低秩层"""
     
-    print("=" * 100)
-    print("Model Throughput Benchmark: FP16 vs INT8 Value Reconstruction")
-    print("=" * 100)
-    print(f"Model: {args.model}")
-    print(f"Rank ratio: {args.rank_ratio}")
-    print(f"Decode steps: {args.decode_steps}")
-    print(f"Iterations: {args.n_iter}")
-    print("=" * 100)
-    
-    # 打印 INT8 支持情况
-    print_int8_support()
-    
-    results = []
-    
-    for model_type in ["FP16", "INT8"]:
-        print(f"\n{'='*50}")
-        print(f"Loading {model_type} model...")
-        print(f"{'='*50}")
+    def __init__(self, in_features: int, out_features: int, rank: int, bias: bool = True, backend: str = "auto"):
+        super().__init__()
+        self.BLinear = nn.Linear(in_features, rank, bias=False)
+        self.ALinear = nn.Linear(rank, out_features, bias=bias)
+        self.backend = backend
         
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
+        # 缓存量化权重
+        self.register_buffer('A_int8', None)
+        self.register_buffer('A_scale', None)
+        self._prepared = False
         
-        # 加载模型
-        if model_type == "FP16":
-            model = load_model_fp16(args.model, truncation_ranks, device)
+        # 选择后端
+        self._select_backend()
+    
+    def _select_backend(self):
+        if self.backend == "auto":
+            try:
+                import bitsandbytes as bnb
+                self.backend = "bnb"
+                self._bnb = bnb
+            except ImportError:
+                if hasattr(torch, '_int_mm'):
+                    self.backend = "torch"
+                else:
+                    self.backend = "fallback"
+    
+    def prepare_int8_weights(self):
+        if self._prepared:
+            return
+        with torch.no_grad():
+            w = self.ALinear.weight.data.float()
+            self.A_int8, self.A_scale = quantize_to_int8_symmetric(w, dim=-1)
+            self._prepared = True
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        latent = self.BLinear(x)
+        return self.forward_int8(latent)
+    
+    def forward_int8(self, latent: torch.Tensor) -> torch.Tensor:
+        """INT8 版本的重建"""
+        
+        if self.backend == "bnb":
+            # bitsandbytes
+            out = self._bnb.matmul(latent, self.ALinear.weight.T)
+            if self.ALinear.bias is not None:
+                out = out + self.ALinear.bias
+            return out
+        
+        elif self.backend == "torch" and hasattr(torch, '_int_mm'):
+            # torch._int_mm
+            if not self._prepared:
+                self.prepare_int8_weights()
+            
+            bsz, seq_len, in_features = latent.shape
+            latent_int8, latent_scale = quantize_to_int8_symmetric(latent.float(), dim=-1)
+            
+            x_2d = latent_int8.view(-1, in_features).contiguous()
+            w_T = self.A_int8.T.contiguous()
+            
+            out_int32 = torch._int_mm(x_2d, w_T)
+            out = out_int32.view(bsz, seq_len, -1).float() * latent_scale * self.A_scale.T
+            
+            if self.ALinear.bias is not None:
+                out = out + self.ALinear.bias
+            
+            return out.to(latent.dtype)
+        
         else:
-            model = load_model_int8(args.model, truncation_ranks, device)
-        
-        print(f"Model loaded. Peak memory: {get_peak_memory_gb():.2f} GB")
-        
-        for batch_size in batch_sizes:
-            for prefill_len in prefill_lens:
-                print(f"\n  Batch: {batch_size}, Prefill: {prefill_len}")
-                
-                input_ids = torch.randint(
-                    0, config.vocab_size, 
-                    (batch_size, prefill_len), 
-                    device=device
-                )
-                
-                torch.cuda.reset_peak_memory_stats()
-                
-                try:
-                    prefill_time, prefill_throughput = benchmark_prefill(
-                        model, input_ids, args.n_iter
-                    )
-                    
-                    decode_time, decode_throughput, decode_latency = benchmark_decode(
-                        model, input_ids, args.decode_steps, args.n_iter
-                    )
-                    
-                    peak_memory = get_peak_memory_gb()
-                    
-                    result = BenchmarkResult(
-                        model_type=model_type,
-                        batch_size=batch_size,
-                        prefill_len=prefill_len,
-                        decode_steps=args.decode_steps,
-                        prefill_time_ms=prefill_time,
-                        prefill_throughput=prefill_throughput,
-                        decode_time_ms=decode_time,
-                        decode_throughput=decode_throughput,
-                        avg_decode_latency_ms=decode_latency,
-                        peak_memory_gb=peak_memory
-                    )
-                    results.append(result)
-                    
-                    print(f"    Prefill: {prefill_time:.2f}ms, {prefill_throughput:.0f} tokens/s")
-                    print(f"    Decode:  {decode_time:.2f}ms, {decode_throughput:.0f} tokens/s, {decode_latency:.2f}ms/token")
-                    print(f"    Memory:  {peak_memory:.2f} GB")
-                    
-                except Exception as e:
-                    print(f"    Error: {e}")
-        
-        del model
-        gc.collect()
-        torch.cuda.empty_cache()
-    
-    return results
+            # Fallback: FP16
+            return self.ALinear(latent)
 
 
-def print_comparison_table(results: List[BenchmarkResult]):
-    """打印对比表格"""
-    print("\n" + "=" * 120)
-    print("Comparison Summary")
-    print("=" * 120)
+# ============================================================================
+# Benchmark 函数
+# ============================================================================
+
+def benchmark_fn(fn, warmup: int = 10, iterations: int = 100) -> float:
+    """测试函数执行时间（毫秒）"""
+    # Warmup
+    for _ in range(warmup):
+        fn()
     
-    configs = set((r.batch_size, r.prefill_len) for r in results)
+    torch.cuda.synchronize()
+    start = time.perf_counter()
     
-    print(f"\n{'Batch':<8}{'Prefill':<10}{'Model':<8}"
-          f"{'Prefill(ms)':<14}{'Prefill(t/s)':<14}"
-          f"{'Decode(ms)':<12}{'Decode(t/s)':<14}{'Latency(ms)':<14}{'Memory(GB)':<12}")
-    print("-" * 120)
+    for _ in range(iterations):
+        fn()
     
-    for batch_size, prefill_len in sorted(configs):
-        fp16_results = [r for r in results 
-                        if r.batch_size == batch_size 
-                        and r.prefill_len == prefill_len 
-                        and r.model_type == "FP16"]
-        int8_results = [r for r in results 
-                        if r.batch_size == batch_size 
-                        and r.prefill_len == prefill_len 
-                        and r.model_type == "INT8"]
+    torch.cuda.synchronize()
+    end = time.perf_counter()
+    
+    return (end - start) * 1000 / iterations
+
+
+def run_benchmark_suite(batch_size: int, seq_len: int, hidden_dim: int, rank: int, 
+                        device: str = "cuda", dtype = torch.float16):
+    """运行完整的 benchmark 套件"""
+    
+    print(f"\n{'=' * 70}")
+    print(f"Benchmark: batch={batch_size}, seq_len={seq_len}, hidden={hidden_dim}, rank={rank}")
+    print(f"{'=' * 70}")
+    
+    # 创建层
+    fp16_layer = ALRDLinearFP16(hidden_dim, hidden_dim, rank).to(device, dtype)
+    int8_layer = ALRDLinearINT8(hidden_dim, hidden_dim, rank, backend="auto").to(device, dtype)
+    
+    # 复制权重
+    int8_layer.BLinear.weight.data.copy_(fp16_layer.BLinear.weight.data)
+    int8_layer.ALinear.weight.data.copy_(fp16_layer.ALinear.weight.data)
+    if fp16_layer.ALinear.bias is not None:
+        int8_layer.ALinear.bias.data.copy_(fp16_layer.ALinear.bias.data)
+    
+    # 准备 INT8 权重
+    int8_layer.prepare_int8_weights()
+    
+    # 创建输入
+    x = torch.randn(batch_size, seq_len, hidden_dim, device=device, dtype=dtype)
+    
+    # 预热
+    with torch.no_grad():
+        _ = fp16_layer(x)
+        _ = int8_layer(x)
+    
+    # 测试 FP16
+    with torch.no_grad():
+        fp16_time = benchmark_fn(lambda: fp16_layer(x))
+    
+    # 测试 INT8
+    with torch.no_grad():
+        int8_time = benchmark_fn(lambda: int8_layer(x))
+    
+    # 计算吞吐量
+    tokens = batch_size * seq_len
+    fp16_throughput = tokens / (fp16_time / 1000)  # tokens/s
+    int8_throughput = tokens / (int8_time / 1000)  # tokens/s
+    
+    speedup = fp16_time / int8_time
+    
+    print(f"\nBackend used: {int8_layer.backend}")
+    print(f"\nLatency:")
+    print(f"  FP16: {fp16_time:.4f} ms")
+    print(f"  INT8: {int8_time:.4f} ms")
+    print(f"  Speedup: {speedup:.2f}x")
+    
+    print(f"\nThroughput:")
+    print(f"  FP16: {fp16_throughput/1e6:.2f}M tokens/s")
+    print(f"  INT8: {int8_throughput/1e6:.2f}M tokens/s")
+    
+    # 验证精度
+    with torch.no_grad():
+        fp16_out = fp16_layer(x)
+        int8_out = int8_layer(x)
         
-        if fp16_results and int8_results:
-            fp16 = fp16_results[0]
-            int8 = int8_results[0]
-            
-            print(f"{batch_size:<8}{prefill_len:<10}{'FP16':<8}"
-                  f"{fp16.prefill_time_ms:<14.2f}{fp16.prefill_throughput:<14.0f}"
-                  f"{fp16.decode_time_ms:<12.2f}{fp16.decode_throughput:<14.0f}"
-                  f"{fp16.avg_decode_latency_ms:<14.2f}{fp16.peak_memory_gb:<12.2f}")
-            
-            prefill_speedup = fp16.prefill_time_ms / int8.prefill_time_ms if int8.prefill_time_ms > 0 else 0
-            decode_speedup = fp16.decode_time_ms / int8.decode_time_ms if int8.decode_time_ms > 0 else 0
-            
-            print(f"{'':<8}{'':<10}{'INT8':<8}"
-                  f"{int8.prefill_time_ms:<14.2f}{int8.prefill_throughput:<14.0f}"
-                  f"{int8.decode_time_ms:<12.2f}{int8.decode_throughput:<14.0f}"
-                  f"{int8.avg_decode_latency_ms:<14.2f}{int8.peak_memory_gb:<12.2f}")
-            
-            print(f"{'':<8}{'':<10}{'Speedup':<8}"
-                  f"{prefill_speedup:<14.2f}x{'':<14}"
-                  f"{decode_speedup:<12.2f}x")
-            print("-" * 120)
+        # 相对误差
+        rel_error = (fp16_out - int8_out).abs().mean() / fp16_out.abs().mean()
+        max_error = (fp16_out - int8_out).abs().max()
+    
+    print(f"\nAccuracy:")
+    print(f"  Mean relative error: {rel_error.item():.6f}")
+    print(f"  Max absolute error: {max_error.item():.6f}")
+    
+    return {
+        'batch_size': batch_size,
+        'seq_len': seq_len,
+        'fp16_time': fp16_time,
+        'int8_time': int8_time,
+        'speedup': speedup,
+        'rel_error': rel_error.item(),
+    }
+
+
+def run_decode_benchmark(batch_size: int, cache_len: int, hidden_dim: int, rank: int,
+                         device: str = "cuda", dtype = torch.float16):
+    """模拟 Decode 阶段的 benchmark"""
+    
+    print(f"\n{'=' * 70}")
+    print(f"Decode Benchmark: batch={batch_size}, cache_len={cache_len}")
+    print(f"{'=' * 70}")
+    
+    # 创建层 (模拟 Value 重建)
+    fp16_layer = ALRDLinearFP16(hidden_dim, hidden_dim, rank).to(device, dtype)
+    int8_layer = ALRDLinearINT8(hidden_dim, hidden_dim, rank, backend="auto").to(device, dtype)
+    
+    # 复制权重
+    int8_layer.BLinear.weight.data.copy_(fp16_layer.BLinear.weight.data)
+    int8_layer.ALinear.weight.data.copy_(fp16_layer.ALinear.weight.data)
+    
+    int8_layer.prepare_int8_weights()
+    
+    # Decode: 单 token 输入，但需要重建整个 cache
+    # 模拟从 KV cache 读取后的重建
+    latent = torch.randn(batch_size, cache_len, rank, device=device, dtype=dtype)
+    
+    with torch.no_grad():
+        fp16_time = benchmark_fn(lambda: fp16_layer.ALinear(latent))
+        int8_time = benchmark_fn(lambda: int8_layer.forward_int8(latent))
+    
+    speedup = fp16_time / int8_time
+    
+    print(f"\nLatency (Reconstruction only):")
+    print(f"  FP16: {fp16_time:.4f} ms")
+    print(f"  INT8: {int8_time:.4f} ms")
+    print(f"  Speedup: {speedup:.2f}x")
+    
+    # 内存节省估算
+    fp16_memory = batch_size * cache_len * rank * 2  # FP16 = 2 bytes
+    int8_memory = batch_size * cache_len * rank * 1  # INT8 = 1 byte
+    memory_saving = (1 - int8_memory / fp16_memory) * 100
+    
+    print(f"\nMemory (Latent storage):")
+    print(f"  FP16: {fp16_memory / 1e6:.2f} MB")
+    print(f"  INT8: {int8_memory / 1e6:.2f} MB")
+    print(f"  Saving: {memory_saving:.1f}%")
+    
+    return {
+        'cache_len': cache_len,
+        'fp16_time': fp16_time,
+        'int8_time': int8_time,
+        'speedup': speedup,
+    }
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Model Throughput Benchmark')
-    
-    # 模型参数
-    parser.add_argument('--model', type=str, required=True,
-                        help='Model path (local path or HuggingFace model name)')
-    parser.add_argument('--rank_ratio', type=float, default=0.25,
-                        help='Low-rank ratio (0.25 = 25%% of original dim)')
-    
-    # 测试参数
-    parser.add_argument('--batch_sizes', type=str, default='1,2,4',
-                        help='Batch sizes to test (comma-separated)')
-    parser.add_argument('--prefill_lens', type=str, default='128,512,1024',
-                        help='Prefill lengths to test (comma-separated)')
-    parser.add_argument('--decode_steps', type=int, default=32,
-                        help='Number of decode steps')
-    parser.add_argument('--n_iter', type=int, default=5,
-                        help='Number of iterations per test')
-    
-    # 输出
-    parser.add_argument('--output', type=str, default='',
-                        help='Output CSV file')
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--hidden_dim', type=int, default=4096, help='Hidden dimension')
+    parser.add_argument('--rank', type=int, default=256, help='Low rank dimension')
+    parser.add_argument('--device', type=str, default='cuda', help='Device')
     args = parser.parse_args()
     
-    results = run_benchmark(args)
+    if not torch.cuda.is_available():
+        print("CUDA not available, using CPU")
+        args.device = "cpu"
     
-    if results:
-        print_comparison_table(results)
+    # 检测后端
+    backends = check_int8_backends()
     
-    # 保存结果
-    if args.output and results:
-        import csv
-        with open(args.output, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                'model_type', 'batch_size', 'prefill_len', 'decode_steps',
-                'prefill_time_ms', 'prefill_throughput', 
-                'decode_time_ms', 'decode_throughput', 'avg_decode_latency_ms',
-                'peak_memory_gb'
-            ])
-            for r in results:
-                writer.writerow([
-                    r.model_type, r.batch_size, r.prefill_len, r.decode_steps,
-                    r.prefill_time_ms, r.prefill_throughput,
-                    r.decode_time_ms, r.decode_throughput, r.avg_decode_latency_ms,
-                    r.peak_memory_gb
-                ])
-        print(f"\nResults saved to {args.output}")
+    print("\n" + "=" * 70)
+    print("BENCHMARK CONFIGURATION")
+    print("=" * 70)
+    print(f"Hidden dim: {args.hidden_dim}")
+    print(f"Rank: {args.rank}")
+    print(f"Device: {args.device}")
     
-    print("\n" + "=" * 100)
-    print("Benchmark Complete!")
-    print("=" * 100)
+    # ========== Prefill Benchmark ==========
+    print("\n" + "#" * 70)
+    print("# PREFILL BENCHMARKS (Various sequence lengths)")
+    print("#" * 70)
+    
+    prefill_configs = [
+        (1, 128),
+        (1, 512),
+        (1, 1024),
+        (1, 2048),
+        (4, 512),
+        (8, 256),
+    ]
+    
+    prefill_results = []
+    for batch_size, seq_len in prefill_configs:
+        try:
+            result = run_benchmark_suite(
+                batch_size=batch_size,
+                seq_len=seq_len,
+                hidden_dim=args.hidden_dim,
+                rank=args.rank,
+                device=args.device,
+            )
+            prefill_results.append(result)
+        except Exception as e:
+            print(f"Error: {e}")
+    
+    # ========== Decode Benchmark ==========
+    print("\n" + "#" * 70)
+    print("# DECODE BENCHMARKS (Value reconstruction from cache)")
+    print("#" * 70)
+    
+    decode_configs = [
+        (1, 1024),
+        (1, 2048),
+        (1, 4096),
+        (8, 1024),
+        (8, 2048),
+    ]
+    
+    decode_results = []
+    for batch_size, cache_len in decode_configs:
+        try:
+            result = run_decode_benchmark(
+                batch_size=batch_size,
+                cache_len=cache_len,
+                hidden_dim=args.hidden_dim,
+                rank=args.rank,
+                device=args.device,
+            )
+            decode_results.append(result)
+        except Exception as e:
+            print(f"Error: {e}")
+    
+    # ========== Summary ==========
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    
+    print("\nPrefill Results:")
+    print(f"{'Batch':>6} {'SeqLen':>8} {'FP16 (ms)':>12} {'INT8 (ms)':>12} {'Speedup':>10}")
+    print("-" * 50)
+    for r in prefill_results:
+        print(f"{r['batch_size']:>6} {r['seq_len']:>8} {r['fp16_time']:>12.4f} {r['int8_time']:>12.4f} {r['speedup']:>10.2f}x")
+    
+    print("\nDecode Results:")
+    print(f"{'CacheLen':>10} {'FP16 (ms)':>12} {'INT8 (ms)':>12} {'Speedup':>10}")
+    print("-" * 50)
+    for r in decode_results:
+        print(f"{r['cache_len']:>10} {r['fp16_time']:>12.4f} {r['int8_time']:>12.4f} {r['speedup']:>10.2f}x")
+    
+    # 结论
+    print("\n" + "=" * 70)
+    print("CONCLUSIONS")
+    print("=" * 70)
+    
+    avg_prefill_speedup = sum(r['speedup'] for r in prefill_results) / len(prefill_results) if prefill_results else 0
+    avg_decode_speedup = sum(r['speedup'] for r in decode_results) / len(decode_results) if decode_results else 0
+    
+    print(f"\nAverage Prefill Speedup: {avg_prefill_speedup:.2f}x")
+    print(f"Average Decode Speedup: {avg_decode_speedup:.2f}x")
+    
+    if avg_prefill_speedup < 1.0 and avg_decode_speedup < 1.0:
+        print("\n⚠️  INT8 is slower than FP16 for both prefill and decode.")
+        print("   This is likely due to:")
+        print("   1. Small matrix sizes (kernel launch overhead dominates)")
+        print("   2. Highly optimized FP16 Tensor Cores on modern GPUs")
+        print("   3. Quantization/dequantization overhead")
+        print("\n   Consider using INT8 only for memory savings (e.g., KV cache compression)")
+    elif avg_decode_speedup > 1.0:
+        print("\n✓ INT8 provides speedup for decode (memory-bound operations)")
+    else:
+        print("\n⚠️  INT8 may only provide memory savings, not compute speedup")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
