@@ -52,6 +52,10 @@ from .int8_matmul import (
     create_int8_value_reconstructor,
     convert_alinear_to_int8,
     INT8_SUPPORTED,
+    # Weight-only INT8 (more practical)
+    WeightOnlyInt8Linear,
+    WeightOnlyInt8ValueReconstructor,
+    create_weight_only_int8_reconstructor,
 )
 
 __all__ = [

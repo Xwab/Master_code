@@ -347,3 +347,126 @@ class Int8ValueReconstructionMixin:
         else:
             # Fallback to original
             return self.v_proj.ALinear(value_states)
+
+
+# ============================================================================
+# Weight-Only INT8 (More Practical Alternative)
+# ============================================================================
+
+class WeightOnlyInt8Linear(nn.Module):
+    """
+    Weight-only INT8 Linear layer.
+    
+    - Weight is stored in INT8 (saves memory)
+    - Activation stays in FP16
+    - Dequantize weight on-the-fly for FP16 matmul
+    
+    This is often faster than W8A8 because:
+    1. No activation quantization overhead
+    2. FP16 Tensor Cores are very fast
+    3. Memory bandwidth is the bottleneck, not compute
+    """
+    
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        per_channel: bool = True,
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.per_channel = per_channel
+        
+        # INT8 weight storage
+        self.register_buffer('weight_int8', torch.zeros(out_features, in_features, dtype=torch.int8))
+        
+        if per_channel:
+            self.register_buffer('weight_scale', torch.ones(out_features, 1, dtype=torch.float16))
+        else:
+            self.register_buffer('weight_scale', torch.ones(1, dtype=torch.float16))
+        
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features, dtype=torch.float16))
+        else:
+            self.register_parameter('bias', None)
+    
+    @torch.no_grad()
+    def quantize_weight(self, weight: torch.Tensor):
+        """Quantize weight to INT8."""
+        weight = weight.to(torch.float16)
+        
+        if self.per_channel:
+            scale = weight.abs().amax(dim=1, keepdim=True) / 127.0
+        else:
+            scale = weight.abs().max() / 127.0
+            scale = scale.view(1)
+        
+        scale = scale.clamp(min=1e-5).to(torch.float16)
+        weight_int8 = (weight / scale).round().clamp(-128, 127).to(torch.int8)
+        
+        self.weight_int8.copy_(weight_int8)
+        self.weight_scale.copy_(scale)
+    
+    @classmethod
+    def from_linear(cls, linear: nn.Linear, per_channel: bool = True):
+        """Create from existing nn.Linear."""
+        woq_linear = cls(
+            linear.in_features,
+            linear.out_features,
+            bias=linear.bias is not None,
+            per_channel=per_channel,
+        )
+        
+        woq_linear = woq_linear.to(linear.weight.device)
+        woq_linear.quantize_weight(linear.weight.data)
+        
+        if linear.bias is not None:
+            woq_linear.bias.data.copy_(linear.bias.data.to(torch.float16))
+        
+        return woq_linear
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward with on-the-fly weight dequantization."""
+        # Dequantize weight: INT8 -> FP16
+        weight_fp16 = self.weight_int8.to(x.dtype) * self.weight_scale.to(x.dtype)
+        
+        # FP16 matmul (uses Tensor Cores)
+        output = F.linear(x, weight_fp16, self.bias)
+        
+        return output
+    
+    def extra_repr(self) -> str:
+        return f'in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}'
+
+
+class WeightOnlyInt8ValueReconstructor(nn.Module):
+    """
+    Weight-only INT8 Value Reconstructor.
+    
+    More practical than full W8A8 for most cases.
+    """
+    
+    def __init__(self, latent_dim: int, out_features: int, bias: bool = True):
+        super().__init__()
+        self.woq_linear = WeightOnlyInt8Linear(latent_dim, out_features, bias=bias)
+    
+    @classmethod
+    def from_linear(cls, linear: nn.Linear):
+        """Create from existing ALinear."""
+        reconstructor = cls(
+            linear.in_features,
+            linear.out_features,
+            bias=linear.bias is not None,
+        )
+        reconstructor.woq_linear = WeightOnlyInt8Linear.from_linear(linear)
+        return reconstructor
+    
+    def forward(self, value_states: torch.Tensor) -> torch.Tensor:
+        return self.woq_linear(value_states)
+
+
+def create_weight_only_int8_reconstructor(alinear: nn.Linear) -> WeightOnlyInt8ValueReconstructor:
+    """Create weight-only INT8 value reconstructor from ALinear."""
+    return WeightOnlyInt8ValueReconstructor.from_linear(alinear)
