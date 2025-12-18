@@ -22,6 +22,7 @@ import torch.nn as nn
 from typing import Optional, Tuple, Union, List
 
 from modules.quant_utils import Quantizer
+from int8_ops import INT8Quantizer, INT8Linear, INT8LinearFunction, TRITON_AVAILABLE
 
 logger = logging.get_logger(__name__)
 
@@ -33,21 +34,20 @@ logger = logging.get_logger(__name__)
 def check_int8_support():
     """检测可用的 INT8 后端"""
     backends = {
-        'torch_int_mm': False,
+        'triton': TRITON_AVAILABLE,
+        'torch_int_mm': hasattr(torch, '_int_mm'),
         'cuda_available': torch.cuda.is_available(),
     }
     
-    if hasattr(torch, '_int_mm'):
-        backends['torch_int_mm'] = True
-        if torch.cuda.is_available():
-            try:
-                a = torch.randint(-128, 127, (32, 64), dtype=torch.int8, device='cuda')
-                b = torch.randint(-128, 127, (64, 32), dtype=torch.int8, device='cuda')
-                _ = torch._int_mm(a, b)
-                backends['torch_int_mm_tested'] = True
-            except Exception as e:
-                backends['torch_int_mm_tested'] = False
-                backends['torch_int_mm_error'] = str(e)
+    if backends['torch_int_mm'] and torch.cuda.is_available():
+        try:
+            a = torch.randint(-128, 127, (32, 64), dtype=torch.int8, device='cuda')
+            b = torch.randint(-128, 127, (64, 32), dtype=torch.int8, device='cuda')
+            _ = torch._int_mm(a, b)
+            backends['torch_int_mm_tested'] = True
+        except Exception as e:
+            backends['torch_int_mm_tested'] = False
+            backends['torch_int_mm_error'] = str(e)
     
     return backends
 
@@ -62,123 +62,93 @@ def get_int8_backends():
 
 
 # ============================================================================
-# INT8 量化工具
-# ============================================================================
-
-@torch.no_grad()
-def quantize_to_int8_symmetric(x, dim=-1):
-    """对称 INT8 量化"""
-    amax = x.abs().amax(dim=dim, keepdim=True).clamp(min=1e-8)
-    scale = amax / 127.0
-    x_int8 = (x / scale).round().clamp(-128, 127).to(torch.int8)
-    return x_int8, scale
-
-
-# ============================================================================
-# INT8 矩阵乘法
-# ============================================================================
-
-def int8_matmul_torch(x_int8: torch.Tensor, w_int8: torch.Tensor, 
-                       x_scale: torch.Tensor, w_scale: torch.Tensor) -> torch.Tensor:
-    """使用 torch._int_mm 的真正 INT8 矩阵乘法"""
-    batch_size, seq_len, in_features = x_int8.shape
-    
-    x_2d = x_int8.view(-1, in_features).contiguous()
-    w_T = w_int8.T.contiguous()
-    
-    out_int32 = torch._int_mm(x_2d, w_T)
-    
-    out = out_int32.view(batch_size, seq_len, -1).float()
-    out = out * x_scale * w_scale.T
-    
-    return out
-
-
-def int8_matmul_fallback(x_int8: torch.Tensor, w_int8: torch.Tensor,
-                          x_scale: torch.Tensor, w_scale: torch.Tensor) -> torch.Tensor:
-    """Fallback: 使用 float32 模拟 (无速度提升)"""
-    out_float = torch.matmul(x_int8.float(), w_int8.T.float())
-    out = out_float * x_scale * w_scale.T
-    return out
-
-
-def int8_matmul(x_int8: torch.Tensor, w_int8: torch.Tensor,
-                x_scale: torch.Tensor, w_scale: torch.Tensor,
-                use_native: bool = True) -> torch.Tensor:
-    """INT8 矩阵乘法统一接口"""
-    backends = get_int8_backends()
-    
-    if use_native and backends.get('torch_int_mm_tested', False) and x_int8.is_cuda:
-        try:
-            return int8_matmul_torch(x_int8, w_int8, x_scale, w_scale)
-        except Exception:
-            pass
-    
-    return int8_matmul_fallback(x_int8, w_int8, x_scale, w_scale)
-
-
-# ============================================================================
 # ALRDLinear INT8 版本
 # ============================================================================
 
 class ALRDLinearINT8(nn.Module):
-    """低秩分解层 - INT8 版本 (Value 重建使用 INT8)"""
+    """
+    低秩分解层 - INT8 版本 (Value 重建使用真正的 INT8 量化)
     
-    def __init__(self, in_features, out_features, rank, bias=True, use_native_int8=True):
+    使用 INT8Quantizer:
+    - Value latent: per-token INT8 量化 (在线)
+    - 重建矩阵 A: per-channel INT8 量化 (预量化)
+    
+    量化流程:
+    1. latent = BLinear(x)
+    2. latent_int8, latent_scale = quantize_per_token(latent)
+    3. out_int32 = latent_int8 @ A_int8.T
+    4. out = dequantize(out_int32, latent_scale, A_scale)
+    """
+    
+    def __init__(self, in_features, out_features, rank, bias=True, backend="auto"):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.rank = rank
-        self.use_native_int8 = use_native_int8
+        self.backend = backend  # "triton", "torch", "auto"
         
+        # 低秩投影 B
         self.BLinear = nn.Linear(in_features, rank, bias=False)
+        
+        # 重建矩阵 A (会被量化)
         self.ALinear = nn.Linear(rank, out_features, bias=bias)
+        
+        # Latent 量化器 (fake quant for BLinear output)
         self.quantizer = Quantizer(n_bits=4, group_size=0, sym=True, clip_ratio=1.0)
         
+        # INT8 预量化的权重
         self.register_buffer('A_int8', None)
         self.register_buffer('A_scale', None)
         self._int8_prepared = False
     
     def prepare_int8_weights(self):
-        """预量化 ALinear 权重为 INT8"""
+        """预量化 ALinear 权重为 INT8 (per-channel)"""
         if self._int8_prepared:
             return
         
         with torch.no_grad():
-            w = self.ALinear.weight.data.float()
-            w_int8, w_scale = quantize_to_int8_symmetric(w, dim=-1)
+            w = self.ALinear.weight.data  # (out_features, rank)
+            # 使用 INT8Quantizer 进行 per-channel 量化
+            w_int8, w_scale = INT8Quantizer.quantize_per_channel(w.float())
             
             self.A_int8 = w_int8.contiguous()
             self.A_scale = w_scale.contiguous()
             self._int8_prepared = True
     
     def quantize_latent(self, latents):
+        """对 latent 进行 fake quant (为了模拟低精度存储)"""
         return self.quantizer(latents)
     
     def quantize_latent_mixed(self, latents):
         return self.quantizer(latents)
     
     def forward_int8(self, latent):
-        """INT8 版本的重建"""
+        """
+        INT8 版本的重建
+        
+        Args:
+            latent: (batch, seq, rank) - 量化后的 latent (fake quant float)
+        
+        Returns:
+            out: (batch, seq, out_features)
+        """
         if not self._int8_prepared:
             self.prepare_int8_weights()
         
-        latent_float = latent.float()
-        latent_int8, latent_scale = quantize_to_int8_symmetric(latent_float, dim=-1)
-        latent_int8 = latent_int8.contiguous()
-        
-        out = int8_matmul(
-            latent_int8, self.A_int8,
-            latent_scale, self.A_scale,
-            use_native=self.use_native_int8
+        # 使用 INT8LinearFunction 进行 INT8 矩阵乘法
+        # 内部会: 量化 latent (per-token) -> INT8 matmul -> 反量化
+        out = INT8LinearFunction.apply(
+            latent,              # 输入
+            self.A_int8,         # 预量化的权重 (int8)
+            self.A_scale,        # 权重 scale
+            self.ALinear.bias,   # 偏置
+            self.backend         # 后端选择
         )
-        
-        if self.ALinear.bias is not None:
-            out = out + self.ALinear.bias
         
         return out.to(latent.dtype)
     
     def forward(self, x):
+        """默认使用 FP16"""
         y = self.BLinear(x)
         y = self.quantizer(y)
         return self.ALinear(y)
