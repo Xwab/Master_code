@@ -1,9 +1,10 @@
 """
 ALRDLlama - INT8 版本
-Value 重建使用 INT8 矩阵乘法 (模拟)
-- Value latent: per-token INT8 量化
-- ALinear.weight: per-channel INT8 量化 (预量化)
-- 使用 INT32 累加后反量化
+Value 重建使用真正的 INT8 矩阵乘法
+
+支持多种 INT8 后端:
+1. torch._int_mm (PyTorch 2.0+, CUDA)
+2. Fallback: INT32 模拟 (无速度提升，仅用于精度测试)
 """
 from transformers import LlamaForCausalLM
 from transformers.models.llama.modeling_llama import (
@@ -25,6 +26,43 @@ logger = logging.get_logger(__name__)
 
 
 # ============================================================================
+# INT8 后端检测
+# ============================================================================
+
+def check_int8_support():
+    """检测可用的 INT8 后端"""
+    backends = {
+        'torch_int_mm': False,
+        'cuda_available': torch.cuda.is_available(),
+    }
+    
+    # 检查 torch._int_mm
+    if hasattr(torch, '_int_mm'):
+        backends['torch_int_mm'] = True
+        try:
+            # 测试是否真的能用
+            a = torch.randint(-128, 127, (32, 64), dtype=torch.int8, device='cuda')
+            b = torch.randint(-128, 127, (64, 32), dtype=torch.int8, device='cuda')
+            _ = torch._int_mm(a, b)
+            backends['torch_int_mm_tested'] = True
+        except Exception as e:
+            backends['torch_int_mm_tested'] = False
+            backends['torch_int_mm_error'] = str(e)
+    
+    return backends
+
+
+# 全局后端状态
+_INT8_BACKENDS = None
+
+def get_int8_backends():
+    global _INT8_BACKENDS
+    if _INT8_BACKENDS is None:
+        _INT8_BACKENDS = check_int8_support()
+    return _INT8_BACKENDS
+
+
+# ============================================================================
 # INT8 量化工具
 # ============================================================================
 
@@ -33,7 +71,7 @@ def quantize_to_int8_symmetric(x, dim=-1):
     """
     对称 INT8 量化
     Args:
-        x: 输入 tensor
+        x: 输入 tensor (float)
         dim: 量化维度
     Returns:
         x_int8: INT8 量化结果
@@ -45,36 +83,73 @@ def quantize_to_int8_symmetric(x, dim=-1):
     return x_int8, scale
 
 
-class INT8MatmulFunction(torch.autograd.Function):
-    """INT8 矩阵乘法的自定义函数"""
+# ============================================================================
+# 真正的 INT8 矩阵乘法
+# ============================================================================
+
+def int8_matmul_torch(x_int8: torch.Tensor, w_int8: torch.Tensor, 
+                       x_scale: torch.Tensor, w_scale: torch.Tensor) -> torch.Tensor:
+    """
+    使用 torch._int_mm 的真正 INT8 矩阵乘法
     
-    @staticmethod
-    def forward(ctx, x, w_int8, w_scale):
-        """
-        x: (batch, seq, in_features) - FP16 输入
-        w_int8: (out_features, in_features) - INT8 预量化权重
-        w_scale: (out_features, 1) - 权重缩放因子
-        """
-        # 量化输入 (per-token)
-        x_int8, x_scale = quantize_to_int8_symmetric(x.float(), dim=-1)
-        
-        # INT8 @ INT8 -> INT32
-        out_int32 = torch.matmul(x_int8.int(), w_int8.T.int())
-        
-        # 反量化
-        out = out_int32.float() * x_scale * w_scale.T
-        
-        return out.to(x.dtype)
+    Args:
+        x_int8: (batch, seq, in_features) INT8 输入
+        w_int8: (out_features, in_features) INT8 权重
+        x_scale: (batch, seq, 1) 输入缩放因子
+        w_scale: (out_features, 1) 权重缩放因子
     
-    @staticmethod
-    def backward(ctx, grad_output):
-        # Straight-through estimator
-        return grad_output, None, None
+    Returns:
+        output: (batch, seq, out_features) FP16/FP32 输出
+    """
+    batch_size, seq_len, in_features = x_int8.shape
+    out_features = w_int8.shape[0]
+    
+    # torch._int_mm 需要 2D 输入
+    x_2d = x_int8.view(-1, in_features).contiguous()  # (batch*seq, in_features)
+    w_T = w_int8.T.contiguous()  # (in_features, out_features)
+    
+    # 真正的 INT8 矩阵乘法 -> INT32 结果
+    out_int32 = torch._int_mm(x_2d, w_T)  # (batch*seq, out_features)
+    
+    # 反量化: out = out_int32 * x_scale * w_scale^T
+    out = out_int32.view(batch_size, seq_len, out_features).float()
+    out = out * x_scale * w_scale.T
+    
+    return out
 
 
-def int8_matmul(x, w_int8, w_scale):
-    """INT8 矩阵乘法封装"""
-    return INT8MatmulFunction.apply(x, w_int8, w_scale)
+def int8_matmul_fallback(x_int8: torch.Tensor, w_int8: torch.Tensor,
+                          x_scale: torch.Tensor, w_scale: torch.Tensor) -> torch.Tensor:
+    """
+    Fallback: 使用 INT32 模拟 (无速度提升)
+    仅用于精度测试或不支持 INT8 kernel 的设备
+    """
+    # 转为 int32 计算
+    out_int32 = torch.matmul(x_int8.int(), w_int8.T.int())
+    
+    # 反量化
+    out = out_int32.float() * x_scale * w_scale.T
+    return out
+
+
+def int8_matmul(x_int8: torch.Tensor, w_int8: torch.Tensor,
+                x_scale: torch.Tensor, w_scale: torch.Tensor,
+                use_native: bool = True) -> torch.Tensor:
+    """
+    INT8 矩阵乘法统一接口
+    
+    Args:
+        use_native: 是否尝试使用原生 INT8 kernel
+    """
+    backends = get_int8_backends()
+    
+    if use_native and backends.get('torch_int_mm_tested', False) and x_int8.is_cuda:
+        try:
+            return int8_matmul_torch(x_int8, w_int8, x_scale, w_scale)
+        except Exception:
+            pass
+    
+    return int8_matmul_fallback(x_int8, w_int8, x_scale, w_scale)
 
 
 # ============================================================================
@@ -84,22 +159,23 @@ def int8_matmul(x, w_int8, w_scale):
 class ALRDLinearINT8(nn.Module):
     """低秩分解层 - INT8 版本 (Value 重建使用 INT8)"""
     
-    def __init__(self, in_features, out_features, rank, bias=True):
+    def __init__(self, in_features, out_features, rank, bias=True, use_native_int8=True):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.rank = rank
+        self.use_native_int8 = use_native_int8
         
         # 低秩投影
         self.BLinear = nn.Linear(in_features, rank, bias=False)
         
-        # 重建矩阵 - 将被替换为 INT8
+        # 重建矩阵 (FP16，会被量化为 INT8)
         self.ALinear = nn.Linear(rank, out_features, bias=bias)
         
         # Latent 量化器
         self.quantizer = Quantizer(n_bits=4, group_size=0, sym=True, clip_ratio=1.0)
         
-        # INT8 权重 (初始化后需要调用 prepare_int8_weights)
+        # INT8 权重 buffers
         self.register_buffer('A_int8', None)
         self.register_buffer('A_scale', None)
         self._int8_prepared = False
@@ -113,9 +189,17 @@ class ALRDLinearINT8(nn.Module):
             w = self.ALinear.weight.data.float()  # (out_features, rank)
             w_int8, w_scale = quantize_to_int8_symmetric(w, dim=-1)
             
-            self.A_int8 = w_int8
-            self.A_scale = w_scale
+            # 确保连续内存布局 (torch._int_mm 需要)
+            self.A_int8 = w_int8.contiguous()
+            self.A_scale = w_scale.contiguous()
             self._int8_prepared = True
+            
+            # 打印后端信息 (首次)
+            backends = get_int8_backends()
+            if backends.get('torch_int_mm_tested', False):
+                print(f"  [INT8] Using native torch._int_mm for {self.out_features}x{self.rank}")
+            else:
+                print(f"  [INT8] Using INT32 fallback for {self.out_features}x{self.rank}")
     
     def quantize_latent(self, latents):
         return self.quantizer(latents)
@@ -124,24 +208,33 @@ class ALRDLinearINT8(nn.Module):
         return self.quantizer(latents)
     
     def forward_fp16(self, x):
-        """FP16 版本的 forward (用于 Key)"""
+        """FP16 版本的 forward"""
         y = self.BLinear(x)
         y = self.quantizer(y)
         return self.ALinear(y)
     
     def forward_int8(self, latent):
-        """INT8 版本的重建 (用于 Value)"""
+        """INT8 版本的重建"""
         if not self._int8_prepared:
             self.prepare_int8_weights()
         
-        # INT8 矩阵乘法
-        out = int8_matmul(latent, self.A_int8, self.A_scale)
+        # Step 1: 量化 latent (per-token)
+        latent_float = latent.float()
+        latent_int8, latent_scale = quantize_to_int8_symmetric(latent_float, dim=-1)
+        latent_int8 = latent_int8.contiguous()
         
-        # 加 bias
+        # Step 2: INT8 矩阵乘法
+        out = int8_matmul(
+            latent_int8, self.A_int8,
+            latent_scale, self.A_scale,
+            use_native=self.use_native_int8
+        )
+        
+        # Step 3: 加 bias
         if self.ALinear.bias is not None:
             out = out + self.ALinear.bias
         
-        return out
+        return out.to(latent.dtype)
     
     def forward(self, x):
         """默认使用 FP16"""
@@ -497,7 +590,7 @@ class ALRDLlamaForCausalLMINT8(LlamaForCausalLM):
         super().__init__(config)
         self.model = CustomLlamaModelINT8(config)
     
-    def replace_with_alrd(self, truncation_ranks: dict):
+    def replace_with_alrd(self, truncation_ranks: dict, use_native_int8: bool = True):
         """将 k_proj 和 v_proj 替换为低秩版本"""
         full_name_dict = {module: name for name, module in self.named_modules()}
         linear_info = {}
@@ -533,7 +626,8 @@ class ALRDLlamaForCausalLMINT8(LlamaForCausalLM):
                         module.in_features,
                         module.out_features,
                         truncation_ranks[name],
-                        bias=module.bias is not None
+                        bias=module.bias is not None,
+                        use_native_int8=use_native_int8
                     )
                 setattr(info["father"], info["name"], new_layer)
         
@@ -541,7 +635,35 @@ class ALRDLlamaForCausalLMINT8(LlamaForCausalLM):
     
     def prepare_int8_weights(self):
         """预量化所有 INT8 权重"""
+        print("\nPreparing INT8 weights...")
+        backends = get_int8_backends()
+        print(f"INT8 backends: {backends}")
+        
         for name, module in self.named_modules():
             if isinstance(module, ALRDLinearINT8):
                 module.prepare_int8_weights()
+        
         return self
+
+
+# ============================================================================
+# 工具函数
+# ============================================================================
+
+def print_int8_support():
+    """打印 INT8 支持情况"""
+    backends = get_int8_backends()
+    print("=" * 60)
+    print("INT8 Backend Support")
+    print("=" * 60)
+    print(f"CUDA available: {backends['cuda_available']}")
+    print(f"torch._int_mm available: {backends['torch_int_mm']}")
+    if 'torch_int_mm_tested' in backends:
+        print(f"torch._int_mm tested: {backends['torch_int_mm_tested']}")
+    if 'torch_int_mm_error' in backends:
+        print(f"torch._int_mm error: {backends['torch_int_mm_error']}")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    print_int8_support()
