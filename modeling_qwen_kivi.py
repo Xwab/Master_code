@@ -77,7 +77,7 @@ class Qwen2KIVISdpaAttention(Qwen2SdpaAttention):
     Qwen2 SDPA Attention with KIVI quantized KV cache.
     
     Uses original full k_proj and v_proj - no low-rank decomposition.
-    Only KV cache storage uses KIVI quantization.
+    KV states are always quantized using KIVI-style quantization.
     """
     
     def __init__(self, config: Qwen2KIVIConfig, layer_idx: int = None):
@@ -89,6 +89,18 @@ class Qwen2KIVISdpaAttention(Qwen2SdpaAttention):
         self.group_size = getattr(config, 'group_size', 32)
         self.residual_length = getattr(config, 'residual_length', 128)
         self.use_kivi = getattr(config, 'use_kivi', True)
+        
+        # Create quantizers for when there's no cache
+        self.key_quantizer = KIVIQuantizer(
+            n_bits=self.k_bits, 
+            group_size=self.group_size, 
+            per_channel=True  # Key: per-channel
+        )
+        self.value_quantizer = KIVIQuantizer(
+            n_bits=self.v_bits, 
+            group_size=self.group_size, 
+            per_channel=False  # Value: per-token
+        )
     
     def forward(
         self,
@@ -139,7 +151,7 @@ class Qwen2KIVISdpaAttention(Qwen2SdpaAttention):
             cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
         
-        # Update KV cache (KIVI cache handles quantization internally)
+        # Update KV cache or apply KIVI quantization directly
         if past_key_value is not None:
             # KIVICache.update() handles quantization automatically
             # Input: [batch, heads, seq_len, head_dim]
@@ -147,6 +159,12 @@ class Qwen2KIVISdpaAttention(Qwen2SdpaAttention):
             key_states, value_states = past_key_value.update(
                 key_states, value_states, self.layer_idx, cache_kwargs=None
             )
+        elif self.use_kivi:
+            # No cache but still apply KIVI quantization
+            # Key: per-channel quantization (along token dimension)
+            # Value: per-token quantization (along head_dim dimension)
+            key_states = self.key_quantizer(key_states)
+            value_states = self.value_quantizer(value_states)
         
         # Repeat K/V for GQA
         key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -195,6 +213,18 @@ class Qwen2KIVIFlashAttention2(Qwen2FlashAttention2):
         self.group_size = getattr(config, 'group_size', 32)
         self.residual_length = getattr(config, 'residual_length', 128)
         self.use_kivi = getattr(config, 'use_kivi', True)
+        
+        # Create quantizers for when there's no cache
+        self.key_quantizer = KIVIQuantizer(
+            n_bits=self.k_bits, 
+            group_size=self.group_size, 
+            per_channel=True  # Key: per-channel
+        )
+        self.value_quantizer = KIVIQuantizer(
+            n_bits=self.v_bits, 
+            group_size=self.group_size, 
+            per_channel=False  # Value: per-token
+        )
     
     def forward(
         self,
@@ -233,11 +263,15 @@ class Qwen2KIVIFlashAttention2(Qwen2FlashAttention2):
             cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
         
-        # Update KV cache
+        # Update KV cache or apply KIVI quantization directly
         if past_key_value is not None:
             key_states, value_states = past_key_value.update(
                 key_states, value_states, self.layer_idx, cache_kwargs=None
             )
+        elif self.use_kivi:
+            # No cache but still apply KIVI quantization
+            key_states = self.key_quantizer(key_states)
+            value_states = self.value_quantizer(value_states)
         
         # Flash attention requires [bsz, seq_len, num_heads, head_dim]
         query_states = query_states.transpose(1, 2)
