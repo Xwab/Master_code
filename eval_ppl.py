@@ -781,12 +781,13 @@ def eval_ppl_generate(model, tokenizer, datasets: str,
 @torch.no_grad()
 def eval_ppl_kivi(model, tokenizer, datasets: str,
                    seqlen: int = 2048, batch_size: int = 8,
-                   device: str = "cuda", limit: int = None) -> Dict:
+                   prefill_len: int = 128, device: str = "cuda", 
+                   limit: int = None) -> Dict:
     """
-    KIVI 模型专用 PPL 测试（支持 batch）
+    KIVI 模型专用 PPL 测试（逐 token 生成，支持 batch）
     
-    不使用 past_key_values，让 KIVI 模型自己管理 cache
-    支持 batch_size > 1 加速测试
+    KIVI 的量化只有在 decoding 阶段才会生效，所以必须逐 token 生成
+    不传递外部 past_key_values，让 KIVI 模型自己管理 cache
     
     Args:
         model: KIVI 模型
@@ -794,6 +795,7 @@ def eval_ppl_kivi(model, tokenizer, datasets: str,
         datasets: 数据集名称
         seqlen: 序列长度
         batch_size: batch 大小
+        prefill_len: prefill 阶段的 token 数
         device: 设备
         limit: 限制序列数量
     """
@@ -812,7 +814,7 @@ def eval_ppl_kivi(model, tokenizer, datasets: str,
     for dataset in datasets.split(","):
         dataset = dataset.strip()
         print(f"\n{'=' * 60}")
-        print(f"Evaluating on: {dataset} (KIVI mode)")
+        print(f"Evaluating on: {dataset} (KIVI mode - token by token)")
         print(f"{'=' * 60}")
         
         # 加载数据
@@ -832,6 +834,7 @@ def eval_ppl_kivi(model, tokenizer, datasets: str,
         print(f"  Sequence length: {seqlen}")
         print(f"  Number of sequences: {nsamples}")
         print(f"  Batch size: {batch_size}")
+        print(f"  Prefill length: {prefill_len}")
         
         if limit is not None:
             nsamples = min(nsamples, limit)
@@ -858,40 +861,53 @@ def eval_ppl_kivi(model, tokenizer, datasets: str,
             
             batch = torch.stack(batch_sequences).to(device)  # (current_batch_size, seqlen)
             
-            # 清理 cache
-            if hasattr(model, 'clear_cache'):
-                model.clear_cache()
-            elif hasattr(model, 'reset_cache'):
-                model.reset_cache()
-            elif hasattr(model, 'clean_cache'):
-                model.clean_cache()
+            # 清理 KIVI cache
+            _clear_kivi_cache(model)
             
-            # 一次性前向传播，不使用外部 cache
-            outputs = model(batch, use_cache=False)
-            logits = outputs.logits  # (batch, seqlen, vocab)
-            
-            # 计算 loss
-            shift_logits = logits[:, :-1, :]  # (batch, seqlen-1, vocab)
-            shift_labels = batch[:, 1:]  # (batch, seqlen-1)
-            
+            actual_prefill_len = min(prefill_len, seqlen - 1)
             loss_fct = nn_module.CrossEntropyLoss(reduction='sum')
-            loss = loss_fct(
-                shift_logits.reshape(-1, vocab_size),
-                shift_labels.reshape(-1)
-            )
             
-            nlls.append(loss.float())
-            total_tokens_processed += current_batch_size * (seqlen - 1)
+            # ===== Prefill 阶段 =====
+            # 输入前 prefill_len 个 token，让 KIVI 初始化 cache
+            prefill_input = batch[:, :actual_prefill_len]  # (batch, prefill_len)
+            
+            outputs = model(prefill_input, use_cache=True)
+            logits = outputs.logits  # (batch, prefill_len, vocab)
+            
+            # Prefill 阶段的 loss (预测第 1 到 prefill_len-1 个 token)
+            prefill_shift_logits = logits[:, :-1, :]  # (batch, prefill_len-1, vocab)
+            prefill_shift_labels = batch[:, 1:actual_prefill_len]  # (batch, prefill_len-1)
+            
+            prefill_loss = loss_fct(
+                prefill_shift_logits.reshape(-1, vocab_size),
+                prefill_shift_labels.reshape(-1)
+            )
+            nlls.append(prefill_loss.float())
+            total_tokens_processed += current_batch_size * (actual_prefill_len - 1)
+            
+            # ===== Decode 阶段（逐 token）=====
+            # KIVI 模型内部会自己管理 cache，我们只需要输入单个 token
+            for pos in range(actual_prefill_len, seqlen):
+                # 当前输入 token (上一个位置的 token)
+                current_token = batch[:, pos - 1:pos]  # (batch, 1)
+                target_token = batch[:, pos]  # (batch,)
+                
+                # 前向传播，KIVI 内部使用 cache
+                outputs = model(current_token, use_cache=True)
+                logits = outputs.logits  # (batch, 1, vocab)
+                
+                # 计算 loss
+                token_loss = loss_fct(
+                    logits.squeeze(1),  # (batch, vocab)
+                    target_token  # (batch,)
+                )
+                nlls.append(token_loss.float())
+                total_tokens_processed += current_batch_size
+            
+            # 清理 KIVI cache
+            _clear_kivi_cache(model)
             
             del batch, outputs, logits
-            
-            # 清理 cache（再次确保）
-            if hasattr(model, 'clear_cache'):
-                model.clear_cache()
-            elif hasattr(model, 'reset_cache'):
-                model.reset_cache()
-            elif hasattr(model, 'clean_cache'):
-                model.clean_cache()
         
         # 计算 PPL
         total_nll = torch.stack(nlls).sum()
@@ -912,6 +928,31 @@ def eval_ppl_kivi(model, tokenizer, datasets: str,
         clear_gpu_memory()
     
     return results
+
+
+def _clear_kivi_cache(model):
+    """清理 KIVI 模型的 cache"""
+    if hasattr(model, 'clear_cache'):
+        model.clear_cache()
+    elif hasattr(model, 'reset_cache'):
+        model.reset_cache()
+    elif hasattr(model, 'clean_cache'):
+        model.clean_cache()
+    # 尝试清理每一层的 cache
+    for name, module in model.named_modules():
+        if hasattr(module, 'clear_cache'):
+            module.clear_cache()
+        elif hasattr(module, 'reset_cache'):
+            module.reset_cache()
+        elif hasattr(module, 'clean_cache'):
+            module.clean_cache()
+        # KIVI 特定的 cache 属性
+        if hasattr(module, 'kv_cache'):
+            module.kv_cache = None
+        if hasattr(module, 'key_cache'):
+            module.key_cache = None
+        if hasattr(module, 'value_cache'):
+            module.value_cache = None
 
 
 @torch.no_grad()
@@ -1237,13 +1278,14 @@ def main():
             limit=args.limit,
         )
     elif args.mode == 'kivi':
-        # KIVI 模式：不使用外部 cache，支持 batch
-        print("\n  Using: eval_ppl_kivi (no external cache, batch supported)")
+        # KIVI 模式：逐 token 生成，让 KIVI 内部管理 cache
+        print("\n  Using: eval_ppl_kivi (token-by-token, KIVI internal cache)")
         results = eval_ppl_kivi(
             model, tokenizer,
             datasets=','.join(datasets),
             seqlen=args.seq_len,
             batch_size=args.batch_size,
+            prefill_len=args.prefill_len,
             device=args.device,
             limit=args.limit,
         )
