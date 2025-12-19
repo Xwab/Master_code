@@ -24,6 +24,15 @@ from .kivi_cache import (
     create_kivi_cache,
 )
 
+# General KIVI cache for standard models (Qwen, Llama without low-rank)
+from .kivi_cache_general import (
+    KIVICache as KIVIGeneralCache,
+    KIVIQuantizer as KIVIGeneralQuantizer,
+    create_kivi_cache as create_general_kivi_cache,
+    apply_kivi_to_model,
+    patch_model_generate,
+)
+
 from .kivi_mixed_cache import (
     KIVIMixedPrecisionQuantizer,
     ALRDLinear_KIVI_Value_FullRank_Mixed,
@@ -64,7 +73,7 @@ __all__ = [
     "Quantizer2",
     "quantize_tensor",
     "quantize_tensor_forward",
-    # KIVI quantization
+    # KIVI quantization (for low-rank ALRD models)
     "KIVIKeyQuantizer",
     "KIVIValueQuantizer", 
     "KIVIMixedQuantizer",
@@ -76,6 +85,12 @@ __all__ = [
     "KIVILatentCache",
     "create_kivi_quantizers",
     "create_kivi_cache",
+    # General KIVI cache (for standard models like Qwen, Llama)
+    "KIVIGeneralCache",
+    "KIVIGeneralQuantizer",
+    "create_general_kivi_cache",
+    "apply_kivi_to_model",
+    "patch_model_generate",
     # Mixed-precision KIVI (full-rank) - 4bit/2bit
     "KIVIMixedPrecisionQuantizer",
     "ALRDLinear_KIVI_Value_FullRank_Mixed",
