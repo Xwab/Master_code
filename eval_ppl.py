@@ -1,13 +1,14 @@
 """
 PPL (Perplexity) 评估脚本
 
-支持 wikitext2 和 ptb 数据集
+支持 wikitext2, c4, ptb 数据集
 支持有 KV cache 管理的模型（逐 token 生成）
 支持 batch size > 1
 
 使用方法:
-    python eval_ppl.py --model /path/to/model --datasets wikitext2,ptb
+    python eval_ppl.py --model /path/to/model --datasets wikitext2,c4,ptb
     python eval_ppl.py --model /path/to/model --batch_size 8 --seq_len 2048
+    python eval_ppl.py --model /path/to/model --mode sequential --prefill_len 128
 """
 
 import torch
@@ -54,84 +55,104 @@ def clear_gpu_memory():
 # 数据集加载
 # ============================================================================
 
-def load_wikitext2(tokenizer, seq_len: int = 2048) -> List[torch.Tensor]:
-    """加载 wikitext2 数据集并分割成固定长度的序列"""
-    print("Loading wikitext2...")
-    
-    try:
-        dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-    except Exception as e:
-        print(f"Failed to load from HuggingFace, trying local: {e}")
-        dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test", 
-                               trust_remote_code=True)
-    
-    # 合并所有文本
-    text = "\n\n".join(dataset["text"])
-    
-    # Tokenize
-    encodings = tokenizer(text, return_tensors="pt", add_special_tokens=False)
-    input_ids = encodings.input_ids[0]
-    
-    print(f"  Total tokens: {len(input_ids)}")
-    
-    # 分割成固定长度序列
-    sequences = []
-    for i in range(0, len(input_ids) - seq_len, seq_len):
-        sequences.append(input_ids[i:i + seq_len])
-    
-    # 如果最后剩余的 tokens 足够长，也加入
-    remaining = len(input_ids) % seq_len
-    if remaining >= seq_len // 2:
-        # 补齐到 seq_len
-        last_seq = input_ids[-(seq_len):]
-        sequences.append(last_seq)
-    
-    print(f"  Number of sequences: {len(sequences)}")
-    
-    return sequences
+class TokenizerWrapper:
+    """Wrapper for tokenized input IDs"""
+    def __init__(self, input_ids):
+        self.input_ids = input_ids
 
 
-def load_ptb(tokenizer, seq_len: int = 2048) -> List[torch.Tensor]:
-    """加载 PTB 数据集并分割成固定长度的序列"""
-    print("Loading PTB...")
+def get_ppl_eval_loaders(name: str, tokenizer, seqlen: int = 2048):
+    """
+    加载评估数据集
     
-    try:
-        dataset = load_dataset("ptb_text_only", "penn_treebank", split="test")
-    except Exception as e:
-        print(f"Failed to load PTB, trying alternative: {e}")
-        try:
-            dataset = load_dataset("ptb-text-only/ptb_text_only", split="test")
-        except:
-            print("  PTB dataset not available, skipping...")
-            return []
+    Args:
+        name: 数据集名称 - "wikitext2", "c4", "ptb"
+        tokenizer: tokenizer
+        seqlen: 序列长度
     
-    # 合并所有文本
-    text = "\n".join(dataset["sentence"])
+    Returns:
+        TokenizerWrapper 或包含 input_ids 的对象
+    """
+    if "wikitext2" in name:
+        print("Loading wikitext2...")
+        testdata = load_dataset(
+            "wikitext",
+            "wikitext-2-raw-v1",
+            split="test",
+        )
+        testenc = tokenizer("\n\n".join(testdata["text"]), return_tensors="pt")
+        print(f"  Total tokens: {testenc.input_ids.shape[1]}")
+        return testenc
     
-    # Tokenize
-    encodings = tokenizer(text, return_tensors="pt", add_special_tokens=False)
-    input_ids = encodings.input_ids[0]
+    elif "c4" in name:
+        print("Loading C4...")
+        valdata = load_dataset(
+            "allenai/c4",
+            data_files={"validation": "en/c4-validation.00000-of-00008.json.gz"},
+            revision="607bd4c8450a42878aa9ddc051a65a055450ef87",
+            split="validation",
+        )
+        testenc = tokenizer(' '.join(valdata[:1100]['text']), return_tensors='pt')
+        testenc = testenc.input_ids[:, :(256 * seqlen)]
+        testenc = TokenizerWrapper(testenc)
+        print(f"  Total tokens: {testenc.input_ids.shape[1]}")
+        return testenc
     
-    print(f"  Total tokens: {len(input_ids)}")
+    elif "ptb" in name:
+        print("Loading PTB...")
+        valdata = load_dataset(
+            "ptb-text-only/ptb_text_only",
+            "penn_treebank",
+            split="validation",
+        )
+        testenc = tokenizer("\n\n".join(valdata["sentence"]), return_tensors="pt")
+        print(f"  Total tokens: {testenc.input_ids.shape[1]}")
+        return testenc
     
-    # 分割成固定长度序列
+    else:
+        raise NotImplementedError(f"Unknown dataset: {name}")
+
+
+def split_into_sequences(input_ids: torch.Tensor, seq_len: int) -> List[torch.Tensor]:
+    """
+    将 tokenized input_ids 分割成固定长度的序列
+    
+    Args:
+        input_ids: shape (1, total_len) 或 (total_len,)
+        seq_len: 目标序列长度
+    
+    Returns:
+        序列列表，每个 shape (seq_len,)
+    """
+    # 确保是 1D
+    if input_ids.dim() == 2:
+        input_ids = input_ids.squeeze(0)
+    
+    total_len = input_ids.shape[0]
+    
+    # 计算可以分出多少完整序列
+    num_sequences = total_len // seq_len
+    
     sequences = []
-    for i in range(0, len(input_ids) - seq_len, seq_len):
-        sequences.append(input_ids[i:i + seq_len])
-    
-    # 如果最后剩余的 tokens 足够长，也加入
-    remaining = len(input_ids) % seq_len
-    if remaining >= seq_len // 2:
-        last_seq = input_ids[-(seq_len):]
-        sequences.append(last_seq)
-    
-    print(f"  Number of sequences: {len(sequences)}")
+    for i in range(num_sequences):
+        start = i * seq_len
+        end = start + seq_len
+        sequences.append(input_ids[start:end])
     
     return sequences
 
 
 def create_batches(sequences: List[torch.Tensor], batch_size: int) -> List[torch.Tensor]:
-    """将序列分成 batches，处理不能整除的情况"""
+    """
+    将序列分成 batches，处理不能整除的情况
+    
+    Args:
+        sequences: 序列列表
+        batch_size: batch 大小
+    
+    Returns:
+        batch 列表，每个 shape (batch_size, seq_len) 或 (remaining, seq_len)
+    """
     batches = []
     num_sequences = len(sequences)
     
@@ -144,6 +165,37 @@ def create_batches(sequences: List[torch.Tensor], batch_size: int) -> List[torch
             batches.append(batch)
     
     return batches
+
+
+def prepare_dataset(name: str, tokenizer, seq_len: int, batch_size: int) -> Tuple[List[torch.Tensor], int]:
+    """
+    加载数据集并准备 batches
+    
+    Returns:
+        (batches, num_sequences)
+    """
+    # 加载数据
+    testenc = get_ppl_eval_loaders(name, tokenizer, seq_len)
+    input_ids = testenc.input_ids
+    
+    # 分割成序列
+    sequences = split_into_sequences(input_ids, seq_len)
+    print(f"  Number of sequences: {len(sequences)}")
+    
+    if len(sequences) == 0:
+        return [], 0
+    
+    # 创建 batches
+    batches = create_batches(sequences, batch_size)
+    print(f"  Number of batches: {len(batches)}")
+    
+    # 打印最后一个 batch 的信息
+    if len(batches) > 0:
+        last_batch_size = batches[-1].shape[0]
+        if last_batch_size < batch_size:
+            print(f"  Last batch size: {last_batch_size} (partial)")
+    
+    return batches, len(sequences)
 
 
 # ============================================================================
@@ -438,7 +490,7 @@ def evaluate_model(model, tokenizer, datasets: List[str],
     Args:
         model: 模型
         tokenizer: tokenizer
-        datasets: 数据集列表 ['wikitext2', 'ptb']
+        datasets: 数据集列表 ['wikitext2', 'ptb', 'c4']
         seq_len: 序列长度
         batch_size: batch size
         prefill_len: prefill 长度（用于 sequential 模式）
@@ -468,65 +520,63 @@ def evaluate_model(model, tokenizer, datasets: List[str],
     if mode == "sequential":
         print(f"  Prefill length: {prefill_len}")
     
-    # 加载和评估每个数据集
-    dataset_loaders = {
-        'wikitext2': load_wikitext2,
-        'ptb': load_ptb,
-    }
+    # 支持的数据集
+    supported_datasets = ['wikitext2', 'ptb', 'c4']
     
     for dataset_name in datasets:
         print(f"\n{'=' * 60}")
         print(f"Evaluating on: {dataset_name}")
         print(f"{'=' * 60}")
         
-        if dataset_name not in dataset_loaders:
+        # 检查是否支持
+        if not any(ds in dataset_name for ds in supported_datasets):
             print(f"  Unknown dataset: {dataset_name}, skipping...")
+            print(f"  Supported: {supported_datasets}")
             continue
         
-        # 加载数据
-        sequences = dataset_loaders[dataset_name](tokenizer, seq_len)
-        
-        if len(sequences) == 0:
-            print(f"  No sequences loaded, skipping...")
-            continue
-        
-        # 创建 batches
-        batches = create_batches(sequences, batch_size)
-        print(f"  Number of batches: {len(batches)}")
-        
-        # 处理最后一个不完整的 batch
-        if len(batches) > 0:
-            last_batch_size = batches[-1].shape[0]
-            if last_batch_size < batch_size:
-                print(f"  Last batch size: {last_batch_size} (partial)")
-        
-        # 计算 PPL
-        start_time = time.time()
-        
-        if mode == "standard":
-            result = compute_ppl_standard(model, batches, device)
-        elif mode == "sequential":
-            result = compute_ppl_sequential(model, batches, prefill_len, device)
-        elif mode == "sliding":
-            result = compute_ppl_sliding_window(model, batches, device=device)
-        else:
-            result = compute_ppl_standard(model, batches, device)
-        
-        elapsed = time.time() - start_time
-        result['time_seconds'] = elapsed
-        result['mode'] = mode
-        
-        results[dataset_name] = result
-        
-        print(f"\n  Results for {dataset_name}:")
-        print(f"    PPL: {result['ppl']:.4f}")
-        print(f"    Avg Loss: {result['avg_loss']:.4f}")
-        print(f"    Total Tokens: {result['total_tokens']}")
-        print(f"    Time: {elapsed:.2f}s")
-        
-        # 清理
-        del sequences, batches
-        clear_gpu_memory()
+        try:
+            # 加载数据并准备 batches
+            batches, num_sequences = prepare_dataset(dataset_name, tokenizer, seq_len, batch_size)
+            
+            if len(batches) == 0:
+                print(f"  No sequences loaded, skipping...")
+                continue
+            
+            # 计算 PPL
+            start_time = time.time()
+            
+            if mode == "standard":
+                result = compute_ppl_standard(model, batches, device)
+            elif mode == "sequential":
+                result = compute_ppl_sequential(model, batches, prefill_len, device)
+            elif mode == "sliding":
+                result = compute_ppl_sliding_window(model, batches, device=device)
+            else:
+                result = compute_ppl_standard(model, batches, device)
+            
+            elapsed = time.time() - start_time
+            result['time_seconds'] = elapsed
+            result['mode'] = mode
+            result['num_sequences'] = num_sequences
+            
+            results[dataset_name] = result
+            
+            print(f"\n  Results for {dataset_name}:")
+            print(f"    PPL: {result['ppl']:.4f}")
+            print(f"    Avg Loss: {result['avg_loss']:.4f}")
+            print(f"    Total Tokens: {result['total_tokens']}")
+            print(f"    Sequences: {num_sequences}")
+            print(f"    Time: {elapsed:.2f}s")
+            
+            # 清理
+            del batches
+            clear_gpu_memory()
+            
+        except Exception as e:
+            print(f"  Error loading/evaluating {dataset_name}: {e}")
+            import traceback
+            traceback.print_exc()
+            results[dataset_name] = {'error': str(e)}
     
     return results
 
@@ -539,8 +589,8 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate model PPL on wikitext2/ptb")
     parser.add_argument('--model', type=str, required=True,
                         help='Model path or name')
-    parser.add_argument('--datasets', type=str, default='wikitext2,ptb',
-                        help='Datasets to evaluate, comma-separated (default: wikitext2,ptb)')
+    parser.add_argument('--datasets', type=str, default='wikitext2,c4,ptb',
+                        help='Datasets to evaluate, comma-separated (default: wikitext2,c4,ptb)')
     parser.add_argument('--seq_len', type=int, default=DEFAULT_SEQ_LEN,
                         help=f'Sequence length (default: {DEFAULT_SEQ_LEN})')
     parser.add_argument('--batch_size', type=int, default=DEFAULT_BATCH_SIZE,
@@ -605,16 +655,20 @@ def main():
     )
     
     # 汇总
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 70)
     print("SUMMARY")
-    print("=" * 60)
+    print("=" * 70)
     
-    print(f"\n{'Dataset':<15} {'PPL':>12} {'Avg Loss':>12} {'Tokens':>12} {'Time (s)':>10}")
-    print("-" * 60)
+    print(f"\n{'Dataset':<15} {'PPL':>12} {'Avg Loss':>12} {'Tokens':>12} {'Seqs':>8} {'Time (s)':>10}")
+    print("-" * 70)
     
     for dataset_name, result in results.items():
-        print(f"{dataset_name:<15} {result['ppl']:>12.4f} {result['avg_loss']:>12.4f} "
-              f"{result['total_tokens']:>12} {result['time_seconds']:>10.2f}")
+        if 'error' in result:
+            print(f"{dataset_name:<15} {'ERROR':>12} {'-':>12} {'-':>12} {'-':>8} {'-':>10}")
+        else:
+            num_seqs = result.get('num_sequences', '-')
+            print(f"{dataset_name:<15} {result['ppl']:>12.4f} {result['avg_loss']:>12.4f} "
+                  f"{result['total_tokens']:>12} {num_seqs:>8} {result['time_seconds']:>10.2f}")
     
     # 保存结果
     if args.output:
