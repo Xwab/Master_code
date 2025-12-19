@@ -600,6 +600,293 @@ def eval_ppl_batch_sequential(model, tokenizer, datasets: str,
 
 
 @torch.no_grad()
+def eval_ppl_generate(model, tokenizer, datasets: str,
+                       seqlen: int = 2048, batch_size: int = 1,
+                       prefill_len: int = 128, device: str = "cuda",
+                       limit: int = None) -> Dict:
+    """
+    使用 model.generate 的 PPL 测试（适用于 KIVI 等内部管理 cache 的模型）
+    
+    对于 KIVI 模型，使用 past_key_values 可能会报错，
+    所以这个函数使用 generate 来获取 logits，计算 PPL
+    
+    Args:
+        model: 模型
+        tokenizer: tokenizer
+        datasets: 数据集名称，逗号分隔
+        seqlen: 序列长度
+        batch_size: batch 大小（KIVI 模型建议设为 1）
+        prefill_len: prefill 长度
+        device: 设备
+        limit: 限制测试的序列数量
+    
+    Returns:
+        {dataset_name: {'ppl': ppl, ...}} 的字典
+    """
+    import os
+    nn_module = torch.nn
+    
+    if isinstance(device, str):
+        device = torch.device(device)
+    
+    model = model.to(device)
+    model.eval()
+    
+    results = {}
+    vocab_size = model.config.vocab_size
+    
+    # 设置 pad token
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    
+    for dataset in datasets.split(","):
+        dataset = dataset.strip()
+        print(f"\n{'=' * 60}")
+        print(f"Evaluating on: {dataset} (generate mode)")
+        print(f"{'=' * 60}")
+        
+        # 加载数据
+        model_name = getattr(model.config, '_name_or_path', 'model')
+        cache_testloader = f"/tmp/{dataset}_testloader_{model_name.replace('/', '_')}_all.cache"
+        
+        if os.path.exists(cache_testloader):
+            print(f"  Loading from cache: {cache_testloader}")
+            testloader = torch.load(cache_testloader)
+        else:
+            testloader = get_ppl_eval_loaders(dataset, tokenizer, seqlen)
+            torch.save(testloader, cache_testloader)
+        
+        testenc = testloader.input_ids
+        total_tokens = testenc.numel()
+        nsamples = total_tokens // seqlen
+        
+        print(f"  Total tokens: {total_tokens}")
+        print(f"  Sequence length: {seqlen}")
+        print(f"  Number of sequences: {nsamples}")
+        print(f"  Prefill length: {prefill_len}")
+        
+        if limit is not None:
+            nsamples = min(nsamples, limit)
+            print(f"  Limited to: {nsamples} sequences")
+        
+        nlls = []
+        total_tokens_processed = 0
+        
+        for i in tqdm(range(nsamples), desc=f"PPL ({dataset})"):
+            # 获取当前序列
+            seq = testenc[:, (i * seqlen):((i + 1) * seqlen)].to(device)  # (1, seqlen)
+            
+            # ===== 使用 generate 逐步生成并计算 loss =====
+            # 从 prefill_len 开始，逐个 token 计算
+            
+            actual_prefill_len = min(prefill_len, seqlen - 1)
+            
+            # Prefill 阶段：一次性计算前 prefill_len 个 token 的 loss
+            prefill_input = seq[:, :actual_prefill_len]
+            
+            # 使用 generate 获取 logits
+            outputs = model.generate(
+                prefill_input,
+                max_new_tokens=1,
+                do_sample=False,
+                return_dict_in_generate=True,
+                output_scores=True,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+            
+            # 清理 KIVI cache
+            if hasattr(model, 'clear_cache'):
+                model.clear_cache()
+            elif hasattr(model, 'reset_cache'):
+                model.reset_cache()
+            elif hasattr(model, 'clean_cache'):
+                model.clean_cache()
+            
+            # Prefill 阶段使用 forward 计算 loss（不用 cache）
+            with torch.no_grad():
+                prefill_outputs = model(prefill_input, use_cache=False)
+                prefill_logits = prefill_outputs.logits  # (1, prefill_len, vocab)
+                
+                # 计算 prefill loss
+                shift_logits = prefill_logits[:, :-1, :]
+                shift_labels = seq[:, 1:actual_prefill_len]
+                
+                loss_fct = nn_module.CrossEntropyLoss(reduction='sum')
+                prefill_loss = loss_fct(
+                    shift_logits.reshape(-1, vocab_size),
+                    shift_labels.reshape(-1)
+                )
+                nlls.append(prefill_loss.float())
+                total_tokens_processed += actual_prefill_len - 1
+            
+            # ===== Decode 阶段：逐 token 使用 generate =====
+            for pos in range(actual_prefill_len, seqlen):
+                # 输入是从开头到当前位置的所有 token
+                input_ids = seq[:, :pos]
+                target_token = seq[:, pos]  # 真实的下一个 token
+                
+                # 使用 generate 生成下一个 token 的 logits
+                outputs = model.generate(
+                    input_ids,
+                    max_new_tokens=1,
+                    do_sample=False,
+                    return_dict_in_generate=True,
+                    output_scores=True,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+                
+                # scores[0] 是生成第一个新 token 时的 logits
+                # shape: (batch_size, vocab_size)
+                next_token_logits = outputs.scores[0]
+                
+                # 计算 loss
+                token_loss = loss_fct(
+                    next_token_logits,
+                    target_token
+                )
+                nlls.append(token_loss.float())
+                total_tokens_processed += 1
+                
+                # 清理 KIVI cache
+                if hasattr(model, 'clear_cache'):
+                    model.clear_cache()
+                elif hasattr(model, 'reset_cache'):
+                    model.reset_cache()
+                elif hasattr(model, 'clean_cache'):
+                    model.clean_cache()
+            
+            del seq
+        
+        # 计算 PPL
+        total_nll = torch.stack(nlls).sum()
+        ppl = torch.exp(total_nll / total_tokens_processed)
+        
+        results[dataset] = {
+            'ppl': ppl.item(),
+            'total_nll': total_nll.item(),
+            'total_tokens': total_tokens_processed,
+            'num_sequences': nsamples,
+        }
+        
+        print(f"\n  Results for {dataset}:")
+        print(f"    PPL: {ppl.item():.4f}")
+        print(f"    Total tokens: {total_tokens_processed}")
+        
+        del testenc
+        clear_gpu_memory()
+    
+    return results
+
+
+@torch.no_grad()
+def eval_ppl_kivi(model, tokenizer, datasets: str,
+                   seqlen: int = 2048, device: str = "cuda",
+                   limit: int = None) -> Dict:
+    """
+    KIVI 模型专用 PPL 测试
+    
+    不使用 past_key_values，让 KIVI 模型自己管理 cache
+    每个序列单独处理，避免 batch 导致的问题
+    
+    Args:
+        model: KIVI 模型
+        tokenizer: tokenizer
+        datasets: 数据集名称
+        seqlen: 序列长度
+        device: 设备
+        limit: 限制序列数量
+    """
+    import os
+    nn_module = torch.nn
+    
+    if isinstance(device, str):
+        device = torch.device(device)
+    
+    model = model.to(device)
+    model.eval()
+    
+    results = {}
+    vocab_size = model.config.vocab_size
+    
+    for dataset in datasets.split(","):
+        dataset = dataset.strip()
+        print(f"\n{'=' * 60}")
+        print(f"Evaluating on: {dataset} (KIVI mode)")
+        print(f"{'=' * 60}")
+        
+        # 加载数据
+        model_name = getattr(model.config, '_name_or_path', 'model')
+        cache_testloader = f"/tmp/{dataset}_testloader_{model_name.replace('/', '_')}_all.cache"
+        
+        if os.path.exists(cache_testloader):
+            testloader = torch.load(cache_testloader)
+        else:
+            testloader = get_ppl_eval_loaders(dataset, tokenizer, seqlen)
+            torch.save(testloader, cache_testloader)
+        
+        testenc = testloader.input_ids
+        nsamples = testenc.numel() // seqlen
+        
+        print(f"  Total tokens: {testenc.numel()}")
+        print(f"  Number of sequences: {nsamples}")
+        
+        if limit is not None:
+            nsamples = min(nsamples, limit)
+            print(f"  Limited to: {nsamples} sequences")
+        
+        nlls = []
+        
+        for i in tqdm(range(nsamples), desc=f"PPL ({dataset})"):
+            seq = testenc[:, (i * seqlen):((i + 1) * seqlen)].to(device)
+            
+            # 清理 cache
+            if hasattr(model, 'clear_cache'):
+                model.clear_cache()
+            elif hasattr(model, 'reset_cache'):
+                model.reset_cache()
+            elif hasattr(model, 'clean_cache'):
+                model.clean_cache()
+            
+            # 一次性前向传播，不使用外部 cache
+            outputs = model(seq, use_cache=False)
+            logits = outputs.logits  # (1, seqlen, vocab)
+            
+            # 计算 loss
+            shift_logits = logits[:, :-1, :]
+            shift_labels = seq[:, 1:]
+            
+            loss_fct = nn_module.CrossEntropyLoss()
+            loss = loss_fct(
+                shift_logits.reshape(-1, vocab_size),
+                shift_labels.reshape(-1)
+            )
+            
+            nlls.append(loss.float() * (seqlen - 1))
+            
+            del seq, outputs, logits
+        
+        # 计算 PPL
+        total_nll = torch.stack(nlls).sum()
+        total_tokens = nsamples * (seqlen - 1)
+        ppl = torch.exp(total_nll / total_tokens)
+        
+        results[dataset] = {
+            'ppl': ppl.item(),
+            'total_nll': total_nll.item(),
+            'total_tokens': total_tokens,
+            'num_sequences': nsamples,
+        }
+        
+        print(f"\n  Results for {dataset}:")
+        print(f"    PPL: {ppl.item():.4f}")
+        
+        del testenc
+        clear_gpu_memory()
+    
+    return results
+
+
+@torch.no_grad()
 def eval_ppl_original_style(model, tokenizer, datasets: str,
                              seqlen: int = 2048, device: str = "cuda",
                              limit: int = 512) -> Dict:
@@ -844,9 +1131,10 @@ def main():
     parser.add_argument('--prefill_len', type=int, default=DEFAULT_PREFILL_LEN,
                         help=f'Prefill length for sequential mode (default: {DEFAULT_PREFILL_LEN})')
     parser.add_argument('--mode', type=str, default='auto',
-                        choices=['auto', 'standard', 'sequential', 'sliding', 'batch_sequential', 'original'],
+                        choices=['auto', 'standard', 'sequential', 'sliding', 'batch_sequential', 
+                                 'generate', 'kivi', 'original'],
                         help='PPL computation mode: auto, standard, sequential, sliding, '
-                             'batch_sequential (batch + token-by-token), original (user\'s original style)')
+                             'batch_sequential, generate (for KIVI), kivi (no external cache), original')
     parser.add_argument('--dtype', type=str, default='float16',
                         choices=['float16', 'bfloat16', 'float32'],
                         help='Data type (default: float16)')
@@ -904,6 +1192,29 @@ def main():
             seqlen=args.seq_len,
             batch_size=args.batch_size,
             prefill_len=args.prefill_len,
+            device=args.device,
+            limit=args.limit,
+        )
+    elif args.mode == 'generate':
+        # 使用 generate 模式（KIVI 模型专用）
+        print("\n  Using: eval_ppl_generate (for KIVI models)")
+        print("  WARNING: This mode is slow as it calls generate for each token")
+        results = eval_ppl_generate(
+            model, tokenizer,
+            datasets=','.join(datasets),
+            seqlen=args.seq_len,
+            batch_size=1,  # KIVI 模型建议 batch_size=1
+            prefill_len=args.prefill_len,
+            device=args.device,
+            limit=args.limit,
+        )
+    elif args.mode == 'kivi':
+        # KIVI 模式：不使用外部 cache
+        print("\n  Using: eval_ppl_kivi (no external cache)")
+        results = eval_ppl_kivi(
+            model, tokenizer,
+            datasets=','.join(datasets),
+            seqlen=args.seq_len,
             device=args.device,
             limit=args.limit,
         )
