@@ -427,6 +427,252 @@ def compute_ppl_sliding_window(model, batches: List[torch.Tensor],
 
 
 # ============================================================================
+# PPL 计算 - Batch 版本逐 token 解码（用户原版改进）
+# ============================================================================
+
+@torch.no_grad()
+def eval_ppl_batch_sequential(model, tokenizer, datasets: str, 
+                               seqlen: int = 2048, batch_size: int = 8,
+                               prefill_len: int = 128, device: str = "cuda",
+                               limit: int = None, use_cache_file: bool = True) -> Dict:
+    """
+    Batch 版本的逐个 token 解码 PPL 测试
+    
+    基于用户原版 eval_ppl 函数改进，支持：
+    1. Batch size > 1
+    2. 逐 token 解码（适用于有 KV cache 管理的模型）
+    3. Prefill + Decode 两阶段
+    
+    Args:
+        model: 模型
+        tokenizer: tokenizer
+        datasets: 数据集名称，逗号分隔 (e.g., "wikitext2,c4,ptb")
+        seqlen: 序列长度
+        batch_size: batch 大小
+        prefill_len: prefill 阶段的 token 数
+        device: 设备
+        limit: 限制测试的序列数量（None 表示全部）
+        use_cache_file: 是否使用缓存文件
+    
+    Returns:
+        {dataset_name: ppl} 的字典
+    """
+    import os
+    import nn as nn_module
+    nn_module = torch.nn
+    
+    if isinstance(device, str):
+        device = torch.device(device)
+    
+    model = model.to(device)
+    model.eval()
+    
+    results = {}
+    vocab_size = model.config.vocab_size
+    
+    for dataset in datasets.split(","):
+        dataset = dataset.strip()
+        print(f"\n{'=' * 60}")
+        print(f"Evaluating on: {dataset}")
+        print(f"{'=' * 60}")
+        
+        # 加载数据（支持缓存）
+        model_name = getattr(model.config, '_name_or_path', 'model')
+        cache_testloader = f"/tmp/{dataset}_testloader_{model_name.replace('/', '_')}_all.cache"
+        
+        if use_cache_file and os.path.exists(cache_testloader):
+            print(f"  Loading from cache: {cache_testloader}")
+            testloader = torch.load(cache_testloader)
+        else:
+            testloader = get_ppl_eval_loaders(dataset, tokenizer, seqlen)
+            if use_cache_file:
+                torch.save(testloader, cache_testloader)
+                print(f"  Saved to cache: {cache_testloader}")
+        
+        testenc = testloader.input_ids
+        total_tokens = testenc.numel()
+        nsamples = total_tokens // seqlen
+        
+        print(f"  Total tokens: {total_tokens}")
+        print(f"  Sequence length: {seqlen}")
+        print(f"  Number of sequences: {nsamples}")
+        print(f"  Batch size: {batch_size}")
+        print(f"  Prefill length: {prefill_len}")
+        
+        # 限制序列数量
+        if limit is not None:
+            nsamples = min(nsamples, limit)
+            print(f"  Limited to: {nsamples} sequences")
+        
+        # 计算 batch 数量
+        nbatches = (nsamples + batch_size - 1) // batch_size
+        print(f"  Number of batches: {nbatches}")
+        
+        nlls = []
+        total_tokens_processed = 0
+        
+        for batch_idx in tqdm(range(nbatches), desc=f"PPL ({dataset})"):
+            # 确定当前 batch 的序列范围
+            start_seq = batch_idx * batch_size
+            end_seq = min(start_seq + batch_size, nsamples)
+            current_batch_size = end_seq - start_seq
+            
+            # 构建 batch: (batch_size, seqlen)
+            batch_sequences = []
+            for i in range(start_seq, end_seq):
+                seq = testenc[:, (i * seqlen):((i + 1) * seqlen)]
+                batch_sequences.append(seq.squeeze(0))
+            
+            batch = torch.stack(batch_sequences).to(device)  # (current_batch_size, seqlen)
+            
+            # ===== Prefill 阶段 =====
+            actual_prefill_len = min(prefill_len, seqlen - 1)
+            prefill_ids = batch[:, :actual_prefill_len]  # (batch, prefill_len)
+            
+            # Prefill
+            outputs = model(prefill_ids, use_cache=True)
+            logits = outputs.logits  # (batch, prefill_len, vocab_size)
+            past_key_values = outputs.past_key_values
+            
+            # Prefill 阶段的 loss
+            prefill_shift_logits = logits[:, :-1, :]  # (batch, prefill_len-1, vocab)
+            prefill_shift_labels = batch[:, 1:actual_prefill_len]  # (batch, prefill_len-1)
+            
+            loss_fct = nn_module.CrossEntropyLoss(reduction='sum')
+            prefill_loss = loss_fct(
+                prefill_shift_logits.reshape(-1, vocab_size),
+                prefill_shift_labels.reshape(-1)
+            )
+            nlls.append(prefill_loss.float())
+            total_tokens_processed += current_batch_size * (actual_prefill_len - 1)
+            
+            # ===== Decode 阶段（逐 token）=====
+            for pos in range(actual_prefill_len, seqlen):
+                # 当前输入 token
+                current_token = batch[:, pos - 1:pos]  # (batch, 1)
+                target_token = batch[:, pos]  # (batch,)
+                
+                # 前向传播
+                outputs = model(
+                    current_token,
+                    use_cache=True,
+                    past_key_values=past_key_values
+                )
+                logits = outputs.logits  # (batch, 1, vocab_size)
+                past_key_values = outputs.past_key_values
+                
+                # 计算 loss
+                token_loss = loss_fct(
+                    logits.squeeze(1),  # (batch, vocab_size)
+                    target_token  # (batch,)
+                )
+                nlls.append(token_loss.float())
+                total_tokens_processed += current_batch_size
+            
+            # 清理模型 cache
+            if hasattr(model, 'clear_cache'):
+                model.clear_cache()
+            elif hasattr(model, 'reset_cache'):
+                model.reset_cache()
+            
+            del batch, outputs, past_key_values
+            
+        # 计算 PPL
+        total_nll = torch.stack(nlls).sum()
+        ppl = torch.exp(total_nll / total_tokens_processed)
+        
+        results[dataset] = {
+            'ppl': ppl.item(),
+            'total_nll': total_nll.item(),
+            'total_tokens': total_tokens_processed,
+            'num_sequences': nsamples,
+        }
+        
+        print(f"\n  Results for {dataset}:")
+        print(f"    PPL: {ppl.item():.4f}")
+        print(f"    Total tokens: {total_tokens_processed}")
+        
+        # 清理
+        del testenc
+        clear_gpu_memory()
+    
+    return results
+
+
+@torch.no_grad()
+def eval_ppl_original_style(model, tokenizer, datasets: str,
+                             seqlen: int = 2048, device: str = "cuda",
+                             limit: int = 512) -> Dict:
+    """
+    用户原版 PPL 测试函数（保持原有风格）
+    
+    Args:
+        model: 模型
+        tokenizer: tokenizer
+        datasets: 数据集名称，逗号分隔
+        seqlen: 序列长度
+        device: 设备
+        limit: 限制测试的序列数量
+    
+    Returns:
+        {dataset_name: ppl} 的字典
+    """
+    import os
+    nn_module = torch.nn
+    
+    model = model.to(device)
+    if isinstance(device, str):
+        device = torch.device(device)
+
+    results = {}
+    model_name = getattr(model.config, '_name_or_path', 'model')
+
+    for dataset in datasets.split(","):
+        dataset = dataset.strip()
+        cache_testloader = (
+            f"/tmp/{dataset}_testloader_{model_name.replace('/', '_')}_all.cache"
+        )
+        if os.path.exists(cache_testloader):
+            testloader = torch.load(cache_testloader)
+        else:
+            testloader = get_ppl_eval_loaders(dataset, tokenizer, seqlen)
+            torch.save(testloader, cache_testloader)
+        
+        testenc = testloader.input_ids
+        nsamples = testenc.numel() // seqlen
+        use_cache = model.config.use_cache
+        model.config.use_cache = False
+        model.eval()
+
+        nlls = []
+
+        for i in tqdm(range(nsamples), desc=f"PPL ({dataset})"):
+            if i >= limit:
+                break
+            batch = testenc[:, (i * seqlen) : ((i + 1) * seqlen)].to(device)
+
+            outputs = model.model(batch)
+            hidden_states = outputs[0]
+            logits = model.lm_head(hidden_states)
+            shift_logits = logits[:, :-1, :]
+            shift_labels = testenc[:, (i * seqlen) : ((i + 1) * seqlen)][:, 1:].to(device)
+            loss_fct = nn_module.CrossEntropyLoss()
+            loss = loss_fct(
+                shift_logits.reshape(-1, shift_logits.size(-1)), 
+                shift_labels.reshape(-1)
+            )
+            
+            neg_log_likelihood = loss.float() * seqlen
+            nlls.append(neg_log_likelihood)
+            
+        ppl = torch.exp(torch.stack(nlls).sum() / (len(nlls) * seqlen))
+        model.config.use_cache = use_cache
+        results[dataset] = ppl.item()
+
+    return results
+
+
+# ============================================================================
 # 模型加载
 # ============================================================================
 
@@ -598,8 +844,9 @@ def main():
     parser.add_argument('--prefill_len', type=int, default=DEFAULT_PREFILL_LEN,
                         help=f'Prefill length for sequential mode (default: {DEFAULT_PREFILL_LEN})')
     parser.add_argument('--mode', type=str, default='auto',
-                        choices=['auto', 'standard', 'sequential', 'sliding'],
-                        help='PPL computation mode: auto, standard, sequential (for KV cache models), sliding')
+                        choices=['auto', 'standard', 'sequential', 'sliding', 'batch_sequential', 'original'],
+                        help='PPL computation mode: auto, standard, sequential, sliding, '
+                             'batch_sequential (batch + token-by-token), original (user\'s original style)')
     parser.add_argument('--dtype', type=str, default='float16',
                         choices=['float16', 'bfloat16', 'float32'],
                         help='Data type (default: float16)')
@@ -607,6 +854,8 @@ def main():
                         help='Disable flash attention')
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device (default: cuda)')
+    parser.add_argument('--limit', type=int, default=None,
+                        help='Limit number of sequences to evaluate (default: all)')
     parser.add_argument('--output', type=str, default=None,
                         help='Output JSON file')
     args = parser.parse_args()
@@ -632,6 +881,7 @@ def main():
     print(f"Batch size: {args.batch_size}")
     print(f"Prefill length: {args.prefill_len}")
     print(f"Mode: {args.mode}")
+    print(f"Limit: {args.limit if args.limit else 'all'}")
     print(f"Dtype: {args.dtype}")
     print(f"Flash Attention: {not args.no_flash_attn}")
     print("=" * 60)
@@ -644,15 +894,43 @@ def main():
         use_flash_attn=not args.no_flash_attn
     )
     
-    # 评估
-    results = evaluate_model(
-        model, tokenizer, datasets,
-        seq_len=args.seq_len,
-        batch_size=args.batch_size,
-        prefill_len=args.prefill_len,
-        mode=args.mode,
-        device=args.device
-    )
+    # 根据模式选择评估函数
+    if args.mode == 'batch_sequential':
+        # Batch 版本逐 token 解码
+        print("\n  Using: eval_ppl_batch_sequential")
+        results = eval_ppl_batch_sequential(
+            model, tokenizer, 
+            datasets=','.join(datasets),
+            seqlen=args.seq_len,
+            batch_size=args.batch_size,
+            prefill_len=args.prefill_len,
+            device=args.device,
+            limit=args.limit,
+        )
+    elif args.mode == 'original':
+        # 用户原版风格
+        print("\n  Using: eval_ppl_original_style")
+        limit = args.limit if args.limit is not None else 512
+        results = eval_ppl_original_style(
+            model, tokenizer,
+            datasets=','.join(datasets),
+            seqlen=args.seq_len,
+            device=args.device,
+            limit=limit,
+        )
+        # 转换为统一格式
+        results = {k: {'ppl': v, 'total_tokens': 0, 'num_sequences': 0} 
+                   for k, v in results.items()}
+    else:
+        # 原有评估函数
+        results = evaluate_model(
+            model, tokenizer, datasets,
+            seq_len=args.seq_len,
+            batch_size=args.batch_size,
+            prefill_len=args.prefill_len,
+            mode=args.mode,
+            device=args.device
+        )
     
     # 汇总
     print("\n" + "=" * 70)
@@ -663,12 +941,23 @@ def main():
     print("-" * 70)
     
     for dataset_name, result in results.items():
-        if 'error' in result:
+        if isinstance(result, (int, float)):
+            # 简单格式 (original 模式)
+            print(f"{dataset_name:<15} {result:>12.4f} {'-':>12} {'-':>12} {'-':>8} {'-':>10}")
+        elif 'error' in result:
             print(f"{dataset_name:<15} {'ERROR':>12} {'-':>12} {'-':>12} {'-':>8} {'-':>10}")
         else:
+            ppl = result.get('ppl', 0)
+            avg_loss = result.get('avg_loss', '-')
+            total_tokens = result.get('total_tokens', '-')
             num_seqs = result.get('num_sequences', '-')
-            print(f"{dataset_name:<15} {result['ppl']:>12.4f} {result['avg_loss']:>12.4f} "
-                  f"{result['total_tokens']:>12} {num_seqs:>8} {result['time_seconds']:>10.2f}")
+            time_s = result.get('time_seconds', '-')
+            
+            avg_loss_str = f"{avg_loss:>12.4f}" if isinstance(avg_loss, float) else f"{avg_loss:>12}"
+            time_str = f"{time_s:>10.2f}" if isinstance(time_s, float) else f"{time_s:>10}"
+            
+            print(f"{dataset_name:<15} {ppl:>12.4f} {avg_loss_str} "
+                  f"{total_tokens:>12} {num_seqs:>8} {time_str}")
     
     # 保存结果
     if args.output:
