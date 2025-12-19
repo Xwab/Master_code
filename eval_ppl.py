@@ -780,19 +780,20 @@ def eval_ppl_generate(model, tokenizer, datasets: str,
 
 @torch.no_grad()
 def eval_ppl_kivi(model, tokenizer, datasets: str,
-                   seqlen: int = 2048, device: str = "cuda",
-                   limit: int = None) -> Dict:
+                   seqlen: int = 2048, batch_size: int = 8,
+                   device: str = "cuda", limit: int = None) -> Dict:
     """
-    KIVI 模型专用 PPL 测试
+    KIVI 模型专用 PPL 测试（支持 batch）
     
     不使用 past_key_values，让 KIVI 模型自己管理 cache
-    每个序列单独处理，避免 batch 导致的问题
+    支持 batch_size > 1 加速测试
     
     Args:
         model: KIVI 模型
         tokenizer: tokenizer
         datasets: 数据集名称
         seqlen: 序列长度
+        batch_size: batch 大小
         device: 设备
         limit: 限制序列数量
     """
@@ -828,16 +829,34 @@ def eval_ppl_kivi(model, tokenizer, datasets: str,
         nsamples = testenc.numel() // seqlen
         
         print(f"  Total tokens: {testenc.numel()}")
+        print(f"  Sequence length: {seqlen}")
         print(f"  Number of sequences: {nsamples}")
+        print(f"  Batch size: {batch_size}")
         
         if limit is not None:
             nsamples = min(nsamples, limit)
             print(f"  Limited to: {nsamples} sequences")
         
-        nlls = []
+        # 计算 batch 数量
+        nbatches = (nsamples + batch_size - 1) // batch_size
+        print(f"  Number of batches: {nbatches}")
         
-        for i in tqdm(range(nsamples), desc=f"PPL ({dataset})"):
-            seq = testenc[:, (i * seqlen):((i + 1) * seqlen)].to(device)
+        nlls = []
+        total_tokens_processed = 0
+        
+        for batch_idx in tqdm(range(nbatches), desc=f"PPL ({dataset})"):
+            # 确定当前 batch 的序列范围
+            start_seq = batch_idx * batch_size
+            end_seq = min(start_seq + batch_size, nsamples)
+            current_batch_size = end_seq - start_seq
+            
+            # 构建 batch: (current_batch_size, seqlen)
+            batch_sequences = []
+            for i in range(start_seq, end_seq):
+                seq = testenc[:, (i * seqlen):((i + 1) * seqlen)]
+                batch_sequences.append(seq.squeeze(0))
+            
+            batch = torch.stack(batch_sequences).to(device)  # (current_batch_size, seqlen)
             
             # 清理 cache
             if hasattr(model, 'clear_cache'):
@@ -848,37 +867,46 @@ def eval_ppl_kivi(model, tokenizer, datasets: str,
                 model.clean_cache()
             
             # 一次性前向传播，不使用外部 cache
-            outputs = model(seq, use_cache=False)
-            logits = outputs.logits  # (1, seqlen, vocab)
+            outputs = model(batch, use_cache=False)
+            logits = outputs.logits  # (batch, seqlen, vocab)
             
             # 计算 loss
-            shift_logits = logits[:, :-1, :]
-            shift_labels = seq[:, 1:]
+            shift_logits = logits[:, :-1, :]  # (batch, seqlen-1, vocab)
+            shift_labels = batch[:, 1:]  # (batch, seqlen-1)
             
-            loss_fct = nn_module.CrossEntropyLoss()
+            loss_fct = nn_module.CrossEntropyLoss(reduction='sum')
             loss = loss_fct(
                 shift_logits.reshape(-1, vocab_size),
                 shift_labels.reshape(-1)
             )
             
-            nlls.append(loss.float() * (seqlen - 1))
+            nlls.append(loss.float())
+            total_tokens_processed += current_batch_size * (seqlen - 1)
             
-            del seq, outputs, logits
+            del batch, outputs, logits
+            
+            # 清理 cache（再次确保）
+            if hasattr(model, 'clear_cache'):
+                model.clear_cache()
+            elif hasattr(model, 'reset_cache'):
+                model.reset_cache()
+            elif hasattr(model, 'clean_cache'):
+                model.clean_cache()
         
         # 计算 PPL
         total_nll = torch.stack(nlls).sum()
-        total_tokens = nsamples * (seqlen - 1)
-        ppl = torch.exp(total_nll / total_tokens)
+        ppl = torch.exp(total_nll / total_tokens_processed)
         
         results[dataset] = {
             'ppl': ppl.item(),
             'total_nll': total_nll.item(),
-            'total_tokens': total_tokens,
+            'total_tokens': total_tokens_processed,
             'num_sequences': nsamples,
         }
         
         print(f"\n  Results for {dataset}:")
         print(f"    PPL: {ppl.item():.4f}")
+        print(f"    Total tokens: {total_tokens_processed}")
         
         del testenc
         clear_gpu_memory()
@@ -1209,12 +1237,13 @@ def main():
             limit=args.limit,
         )
     elif args.mode == 'kivi':
-        # KIVI 模式：不使用外部 cache
-        print("\n  Using: eval_ppl_kivi (no external cache)")
+        # KIVI 模式：不使用外部 cache，支持 batch
+        print("\n  Using: eval_ppl_kivi (no external cache, batch supported)")
         results = eval_ppl_kivi(
             model, tokenizer,
             datasets=','.join(datasets),
             seqlen=args.seq_len,
+            batch_size=args.batch_size,
             device=args.device,
             limit=args.limit,
         )
