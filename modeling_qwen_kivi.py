@@ -1,94 +1,94 @@
 """
-Qwen Model with KIVI Quantized KV Cache
+Qwen2 Model with KIVI Quantized KV Cache (No Low-Rank Decomposition)
 
-This module provides a patched version of Qwen models that uses KIVI-style
-KV cache quantization for memory-efficient long-context inference.
+This module modifies Qwen2 to use KIVI-style KV cache quantization:
+- Key: per-channel quantization (along token dimension)
+- Value: per-token quantization (along head_dim dimension)
+- Recent tokens kept in full precision (residual)
 
-Supports:
-- Qwen2
-- Qwen2.5
-- Qwen (original)
+No low-rank decomposition - uses original full model parameters.
 
 Usage:
-    from modeling_qwen_kivi import load_qwen_with_kivi, KIVICache
+    from modeling_qwen_kivi import Qwen2ForCausalLM_KIVI, Qwen2KIVIConfig
     
-    # Load model with KIVI support
-    model, tokenizer = load_qwen_with_kivi(
-        "Qwen/Qwen2-7B-Instruct",
-        k_bits=2, 
-        v_bits=2,
-    )
+    config = Qwen2KIVIConfig.from_pretrained("Qwen/Qwen2-7B-Instruct")
+    config.k_bits = 2
+    config.v_bits = 2
+    model = Qwen2ForCausalLM_KIVI.from_pretrained("Qwen/Qwen2-7B-Instruct", config=config)
     
-    # Generate with automatic KIVI cache
-    outputs = model.generate(input_ids, max_new_tokens=100)
-    
-    # Or manually control the cache
-    cache = KIVICache(k_bits=2, v_bits=2)
+    # Generate with KIVI cache
+    cache = model.create_kivi_cache()
     outputs = model.generate(input_ids, past_key_values=cache, use_cache=True)
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, List, Dict, Any, Union
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
-from transformers.cache_utils import Cache, DynamicCache
-import warnings
+from typing import Optional, Tuple, List, Union, Dict, Any
+from transformers import Qwen2ForCausalLM, Qwen2Config
+from transformers.models.qwen2.modeling_qwen2 import (
+    Qwen2DecoderLayer,
+    Qwen2Attention,
+    Qwen2FlashAttention2,
+    Qwen2SdpaAttention,
+    Qwen2Model,
+    Qwen2RMSNorm,
+    Qwen2RotaryEmbedding,
+    apply_rotary_pos_emb,
+    repeat_kv,
+)
+from transformers.cache_utils import Cache, DynamicCache, StaticCache
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from transformers.utils import logging
 import math
 
-# Import our KIVI cache
-from modules.kivi_cache_general import KIVICache, KIVIQuantizer, create_kivi_cache
+# Import KIVI components
+from modules.kivi_cache_general import KIVICache, KIVIQuantizer
+
+logger = logging.get_logger(__name__)
 
 
-def _make_causal_mask(
-    input_ids_shape: torch.Size,
-    dtype: torch.dtype,
-    device: torch.device,
-    past_key_values_length: int = 0,
-) -> torch.Tensor:
-    """Create causal attention mask."""
-    bsz, tgt_len = input_ids_shape
-    mask = torch.full((tgt_len, tgt_len), torch.finfo(dtype).min, device=device)
-    mask_cond = torch.arange(tgt_len, device=device)
-    mask.masked_fill_(mask_cond < (mask_cond + 1).view(tgt_len, 1), 0)
-    mask = mask.to(dtype)
-
-    if past_key_values_length > 0:
-        mask = torch.cat([
-            torch.zeros(tgt_len, past_key_values_length, dtype=dtype, device=device),
-            mask
-        ], dim=-1)
-    
-    return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_key_values_length)
-
-
-class Qwen2KIVIAttention(nn.Module):
+class Qwen2KIVIConfig(Qwen2Config):
     """
-    Qwen2 attention with KIVI cache support.
+    Configuration for Qwen2 with KIVI quantized KV cache.
+    """
+    model_type = "qwen2_kivi"
     
-    This is a drop-in replacement that adds KIVI quantization
-    while maintaining full compatibility with the original attention.
+    def __init__(
+        self,
+        # KIVI parameters
+        k_bits: int = 2,
+        v_bits: int = 2,
+        group_size: int = 32,
+        residual_length: int = 128,
+        use_kivi: bool = True,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.k_bits = k_bits
+        self.v_bits = v_bits
+        self.group_size = group_size
+        self.residual_length = residual_length
+        self.use_kivi = use_kivi
+
+
+class Qwen2KIVISdpaAttention(Qwen2SdpaAttention):
+    """
+    Qwen2 SDPA Attention with KIVI quantized KV cache.
+    
+    Uses original full k_proj and v_proj - no low-rank decomposition.
+    Only KV cache storage uses KIVI quantization.
     """
     
-    def __init__(self, original_attn, layer_idx: int = 0):
-        super().__init__()
-        self.original_attn = original_attn
-        self.layer_idx = layer_idx
+    def __init__(self, config: Qwen2KIVIConfig, layer_idx: int = None):
+        super().__init__(config, layer_idx)
         
-        # Copy attributes from original
-        self.config = original_attn.config
-        self.hidden_size = original_attn.hidden_size
-        self.num_heads = original_attn.num_heads
-        self.head_dim = original_attn.head_dim
-        self.num_key_value_heads = original_attn.num_key_value_heads
-        self.num_key_value_groups = original_attn.num_key_value_groups
-        
-        # Copy modules
-        self.q_proj = original_attn.q_proj
-        self.k_proj = original_attn.k_proj
-        self.v_proj = original_attn.v_proj
-        self.o_proj = original_attn.o_proj
-        self.rotary_emb = original_attn.rotary_emb
+        # KIVI parameters
+        self.k_bits = getattr(config, 'k_bits', 2)
+        self.v_bits = getattr(config, 'v_bits', 2)
+        self.group_size = getattr(config, 'group_size', 32)
+        self.residual_length = getattr(config, 'residual_length', 128)
+        self.use_kivi = getattr(config, 'use_kivi', True)
     
     def forward(
         self,
@@ -99,13 +99,124 @@ class Qwen2KIVIAttention(nn.Module):
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        """Forward with KIVI cache support."""
+        
+        if output_attentions:
+            logger.warning_once(
+                "Qwen2KIVISdpaAttention does not support output_attentions=True. "
+                "Falling back to eager attention."
+            )
+            return super().forward(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
         
         bsz, q_len, _ = hidden_states.size()
         
-        # Project Q, K, V
+        # Standard Q, K, V projections (full rank, no decomposition)
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+        
+        # Reshape for multi-head attention
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        
+        # Apply rotary embeddings
+        if position_embeddings is None:
+            cos, sin = self.rotary_emb(value_states, position_ids)
+        else:
+            cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        
+        # Update KV cache (KIVI cache handles quantization internally)
+        if past_key_value is not None:
+            # KIVICache.update() handles quantization automatically
+            # Input: [batch, heads, seq_len, head_dim]
+            # Returns: quantized/dequantized key_states, value_states
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx, cache_kwargs=None
+            )
+        
+        # Repeat K/V for GQA
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        
+        # Prepare attention mask
+        causal_mask = attention_mask
+        if attention_mask is not None:
+            causal_mask = causal_mask[:, :, :, :key_states.shape[-2]]
+        
+        # SDPA
+        if query_states.device.type == "cuda" and causal_mask is not None:
+            query_states = query_states.contiguous()
+            key_states = key_states.contiguous()
+            value_states = value_states.contiguous()
+        
+        is_causal = True if causal_mask is None and q_len > 1 else False
+        
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=causal_mask,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+            is_causal=is_causal,
+        )
+        
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(bsz, q_len, -1)
+        attn_output = self.o_proj(attn_output)
+        
+        return attn_output, None, past_key_value
+
+
+class Qwen2KIVIFlashAttention2(Qwen2FlashAttention2):
+    """
+    Qwen2 Flash Attention with KIVI quantized KV cache.
+    """
+    
+    def __init__(self, config: Qwen2KIVIConfig, layer_idx: int = None):
+        super().__init__(config, layer_idx)
+        
+        # KIVI parameters
+        self.k_bits = getattr(config, 'k_bits', 2)
+        self.v_bits = getattr(config, 'v_bits', 2)
+        self.group_size = getattr(config, 'group_size', 32)
+        self.residual_length = getattr(config, 'residual_length', 128)
+        self.use_kivi = getattr(config, 'use_kivi', True)
+    
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        
+        if isinstance(past_key_value, StaticCache):
+            raise ValueError(
+                "FlashAttention2 is not compatible with StaticCache."
+            )
+        
+        bsz, q_len, _ = hidden_states.size()
+        
+        # Standard Q, K, V projections
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
@@ -116,244 +227,273 @@ class Qwen2KIVIAttention(nn.Module):
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         
         # Apply rotary embeddings
-        if hasattr(self.rotary_emb, 'forward'):
+        if position_embeddings is None:
             cos, sin = self.rotary_emb(value_states, position_ids)
-            query_states, key_states = self._apply_rotary_pos_emb(
-                query_states, key_states, cos, sin, position_ids
-            )
+        else:
+            cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
         
-        # Update cache
+        # Update KV cache
         if past_key_value is not None:
-            # KIVICache and DynamicCache both support this interface
             key_states, value_states = past_key_value.update(
                 key_states, value_states, self.layer_idx, cache_kwargs=None
             )
         
-        # Repeat K/V for GQA
-        if self.num_key_value_groups > 1:
-            key_states = self._repeat_kv(key_states, self.num_key_value_groups)
-            value_states = self._repeat_kv(value_states, self.num_key_value_groups)
+        # Flash attention requires [bsz, seq_len, num_heads, head_dim]
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
         
-        # Attention
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        dropout_rate = self.attention_dropout if self.training else 0.0
         
-        if attention_mask is not None:
-            causal_mask = attention_mask
-            if causal_mask.dim() == 2:
-                causal_mask = causal_mask[:, None, None, :]
-            elif causal_mask.dim() == 3:
-                causal_mask = causal_mask[:, None, :, :]
-            attn_weights = attn_weights + causal_mask
+        # Handle dtype
+        input_dtype = query_states.dtype
+        if input_dtype == torch.float32:
+            if torch.is_autocast_enabled():
+                target_dtype = torch.get_autocast_gpu_dtype()
+            elif hasattr(self.config, "_pre_quantization_dtype"):
+                target_dtype = self.config._pre_quantization_dtype
+            else:
+                target_dtype = self.q_proj.weight.dtype
+            
+            query_states = query_states.to(target_dtype)
+            key_states = key_states.to(target_dtype)
+            value_states = value_states.to(target_dtype)
         
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_output = torch.matmul(attn_weights, value_states)
+        # Import flash attention
+        from transformers.modeling_flash_attention_utils import _flash_attention_forward
         
-        # Reshape output
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        attn_output = _flash_attention_forward(
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            q_len,
+            position_ids=position_ids,
+            dropout=dropout_rate,
+            sliding_window=getattr(self, "sliding_window", None),
+            is_causal=self.is_causal,
+        )
+        
+        attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         
-        if not output_attentions:
-            attn_weights = None
+        return attn_output, None, past_key_value
+
+
+class Qwen2KIVIDecoderLayer(Qwen2DecoderLayer):
+    """
+    Qwen2 Decoder Layer with KIVI attention.
+    """
+    
+    def __init__(self, config: Qwen2KIVIConfig, layer_idx: int):
+        super().__init__(config, layer_idx)
         
-        return attn_output, attn_weights, past_key_value
+        # Replace attention with KIVI version
+        attn_implementation = getattr(config, '_attn_implementation', 'sdpa')
+        
+        if attn_implementation == "flash_attention_2":
+            self.self_attn = Qwen2KIVIFlashAttention2(config, layer_idx)
+        elif attn_implementation == "sdpa":
+            self.self_attn = Qwen2KIVISdpaAttention(config, layer_idx)
+        else:
+            # Default to SDPA
+            self.self_attn = Qwen2KIVISdpaAttention(config, layer_idx)
+
+
+class Qwen2KIVIModel(Qwen2Model):
+    """
+    Qwen2 Model with KIVI decoder layers.
+    """
     
-    def _apply_rotary_pos_emb(self, q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-        """Apply rotary position embeddings."""
-        cos = cos.unsqueeze(unsqueeze_dim)
-        sin = sin.unsqueeze(unsqueeze_dim)
-        q_embed = (q * cos) + (self._rotate_half(q) * sin)
-        k_embed = (k * cos) + (self._rotate_half(k) * sin)
-        return q_embed, k_embed
-    
-    def _rotate_half(self, x):
-        """Rotate half the hidden dims."""
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        return torch.cat((-x2, x1), dim=-1)
-    
-    def _repeat_kv(self, hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-        """Repeat KV heads for GQA."""
-        if n_rep == 1:
-            return hidden_states
-        batch, num_kv_heads, slen, head_dim = hidden_states.shape
-        hidden_states = hidden_states[:, :, None, :, :].expand(
-            batch, num_kv_heads, n_rep, slen, head_dim
+    def __init__(self, config: Qwen2KIVIConfig):
+        super().__init__(config)
+        
+        # Replace decoder layers with KIVI versions
+        self.layers = nn.ModuleList(
+            [Qwen2KIVIDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        return hidden_states.reshape(batch, num_kv_heads * n_rep, slen, head_dim)
-
-
-def patch_qwen_model(
-    model,
-    k_bits: int = 2,
-    v_bits: int = 2,
-    group_size: int = 32,
-    residual_length: int = 128,
-    auto_inject_cache: bool = True,
-):
-    """
-    Patch a Qwen model to use KIVI cache.
     
-    Args:
-        model: Qwen model (Qwen2ForCausalLM, etc.)
-        k_bits: Key quantization bits
-        v_bits: Value quantization bits
-        group_size: Quantization group size
-        residual_length: Full precision residual length
-        auto_inject_cache: Whether to auto-inject KIVI cache in generate()
-    """
-    # Store KIVI config
-    model.kivi_config = {
-        "k_bits": k_bits,
-        "v_bits": v_bits,
-        "group_size": group_size,
-        "residual_length": residual_length,
-    }
-    
-    # Add cache creation method
-    def create_kivi_cache():
-        return KIVICache(
-            k_bits=k_bits,
-            v_bits=v_bits,
-            group_size=group_size,
-            residual_length=residual_length,
-        )
-    model.create_kivi_cache = create_kivi_cache
-    
-    # Patch generate if requested
-    if auto_inject_cache:
-        original_generate = model.generate
-        
-        def patched_generate(
-            inputs=None,
-            generation_config=None,
-            **kwargs,
-        ):
-            # Create fresh KIVI cache for each generation
-            if 'past_key_values' not in kwargs or kwargs['past_key_values'] is None:
-                kwargs['past_key_values'] = create_kivi_cache()
-            
-            # Ensure use_cache is True
-            if 'use_cache' not in kwargs:
-                kwargs['use_cache'] = True
-            
-            return original_generate(inputs, generation_config=generation_config, **kwargs)
-        
-        model.generate = patched_generate
-        model._original_generate = original_generate
-    
-    print(f"Qwen model patched with KIVI: k={k_bits}bit, v={v_bits}bit, "
-          f"group_size={group_size}, residual={residual_length}")
-    
-    return model
-
-
-def load_qwen_with_kivi(
-    model_name_or_path: str,
-    k_bits: int = 2,
-    v_bits: int = 2,
-    group_size: int = 32,
-    residual_length: int = 128,
-    device_map: str = "auto",
-    torch_dtype: torch.dtype = torch.float16,
-    trust_remote_code: bool = True,
-    auto_inject_cache: bool = True,
-    **model_kwargs,
-) -> Tuple[Any, Any]:
-    """
-    Load a Qwen model with KIVI cache support.
-    
-    Args:
-        model_name_or_path: Model identifier or path
-        k_bits: Key quantization bits (2, 4, 8, 16)
-        v_bits: Value quantization bits (2, 4, 8, 16)
-        group_size: Quantization group size
-        residual_length: Full precision residual length
-        device_map: Device placement strategy
-        torch_dtype: Model dtype
-        trust_remote_code: Whether to trust remote code
-        auto_inject_cache: Auto-inject KIVI cache in generate()
-        **model_kwargs: Additional model loading arguments
-        
-    Returns:
-        model: Patched Qwen model
-        tokenizer: Tokenizer
-        
-    Example:
-        model, tokenizer = load_qwen_with_kivi(
-            "Qwen/Qwen2-7B-Instruct",
-            k_bits=2,
-            v_bits=2,
-        )
-        
-        outputs = model.generate(
-            tokenizer("Hello", return_tensors="pt").input_ids.cuda(),
-            max_new_tokens=100,
-        )
-        print(tokenizer.decode(outputs[0]))
-    """
-    print(f"Loading {model_name_or_path}...")
-    
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name_or_path,
-        trust_remote_code=trust_remote_code,
-    )
-    
-    # Load model
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name_or_path,
-        device_map=device_map,
-        torch_dtype=torch_dtype,
-        trust_remote_code=trust_remote_code,
-        **model_kwargs,
-    )
-    
-    # Patch model
-    patch_qwen_model(
-        model,
-        k_bits=k_bits,
-        v_bits=v_bits,
-        group_size=group_size,
-        residual_length=residual_length,
-        auto_inject_cache=auto_inject_cache,
-    )
-    
-    return model, tokenizer
-
-
-# ============================================================================
-# Alternative: Wrap entire model forward
-# ============================================================================
-
-class QwenKIVIWrapper(nn.Module):
-    """
-    Wrapper that adds KIVI cache to any Qwen model.
-    
-    This is an alternative to patching that wraps the entire model.
-    """
-    
-    def __init__(
+    def forward(
         self,
-        model,
-        k_bits: int = 2,
-        v_bits: int = 2,
-        group_size: int = 32,
-        residual_length: int = 128,
-    ):
-        super().__init__()
-        self.model = model
-        self.k_bits = k_bits
-        self.v_bits = v_bits
-        self.group_size = group_size
-        self.residual_length = residual_length
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+    ) -> Union[Tuple, BaseModelOutputWithPast]:
         
-        # Preserve model attributes
-        self.config = model.config
-        self.device = next(model.parameters()).device
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+        
+        if self.gradient_checkpointing and self.training and use_cache:
+            logger.warning_once(
+                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
+            )
+            use_cache = False
+        
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+        
+        # Handle legacy cache format
+        return_legacy_cache = False
+        if use_cache and not isinstance(past_key_values, Cache):
+            return_legacy_cache = True
+            if past_key_values is None:
+                past_key_values = DynamicCache()
+            else:
+                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+        
+        # Setup cache position
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            )
+        
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+        
+        # Create causal mask
+        causal_mask = self._update_causal_mask(
+            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+        )
+        
+        hidden_states = inputs_embeds
+        
+        # Create position embeddings
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        
+        # Decoder layers
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+        next_decoder_cache = None
+        
+        for decoder_layer in self.layers:
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+            
+            if self.gradient_checkpointing and self.training:
+                layer_outputs = self._gradient_checkpointing_func(
+                    decoder_layer.__call__,
+                    hidden_states,
+                    causal_mask,
+                    position_ids,
+                    past_key_values,
+                    output_attentions,
+                    use_cache,
+                    cache_position,
+                    position_embeddings,
+                )
+            else:
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    attention_mask=causal_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_values,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                )
+            
+            hidden_states = layer_outputs[0]
+            
+            if use_cache:
+                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+            
+            if output_attentions:
+                all_self_attns += (layer_outputs[1],)
+        
+        hidden_states = self.norm(hidden_states)
+        
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+        
+        next_cache = next_decoder_cache if use_cache else None
+        if return_legacy_cache:
+            next_cache = next_cache.to_legacy_cache()
+        
+        if not return_dict:
+            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+        
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=next_cache,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns,
+        )
+
+
+class Qwen2ForCausalLM_KIVI(Qwen2ForCausalLM):
+    """
+    Qwen2 for Causal LM with KIVI quantized KV cache.
+    
+    This model uses KIVI-style quantization for the KV cache:
+    - Key: per-channel quantization (along token dimension)
+    - Value: per-token quantization (along head_dim dimension)
+    - Recent tokens kept in full precision (residual)
+    
+    No low-rank decomposition - uses original full model parameters.
+    
+    Usage:
+        # Load with KIVI config
+        config = Qwen2KIVIConfig.from_pretrained("Qwen/Qwen2-7B-Instruct")
+        config.k_bits = 2
+        config.v_bits = 2
+        model = Qwen2ForCausalLM_KIVI.from_pretrained(
+            "Qwen/Qwen2-7B-Instruct",
+            config=config,
+        )
+        
+        # Method 1: Create KIVI cache manually
+        cache = model.create_kivi_cache()
+        outputs = model.generate(input_ids, past_key_values=cache, use_cache=True)
+        
+        # Method 2: Auto-inject KIVI cache (enable with model.use_kivi_cache = True)
+        model.use_kivi_cache = True
+        outputs = model.generate(input_ids, use_cache=True)
+    """
+    
+    config_class = Qwen2KIVIConfig
+    
+    def __init__(self, config: Qwen2KIVIConfig):
+        super().__init__(config)
+        
+        # Replace model with KIVI version
+        self.model = Qwen2KIVIModel(config)
+        
+        # Store KIVI parameters
+        self.k_bits = getattr(config, 'k_bits', 2)
+        self.v_bits = getattr(config, 'v_bits', 2)
+        self.group_size = getattr(config, 'group_size', 32)
+        self.residual_length = getattr(config, 'residual_length', 128)
+        self.use_kivi = getattr(config, 'use_kivi', True)
+        
+        # Flag to auto-inject KIVI cache (default: False)
+        self.use_kivi_cache = False
     
     def create_kivi_cache(self) -> KIVICache:
-        """Create a new KIVI cache."""
+        """
+        Create a KIVI cache for this model.
+        
+        Returns:
+            KIVICache configured with model's KIVI parameters
+            
+        Usage:
+            cache = model.create_kivi_cache()
+            outputs = model.generate(input_ids, past_key_values=cache, use_cache=True)
+        """
         return KIVICache(
             k_bits=self.k_bits,
             v_bits=self.v_bits,
@@ -369,17 +509,26 @@ class QwenKIVIWrapper(nn.Module):
         past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = True,
+        use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
-    ):
-        # Create KIVI cache if needed
-        if use_cache and past_key_values is None:
-            past_key_values = self.create_kivi_cache()
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        """
+        Forward pass with optional auto-injection of KIVI cache.
         
-        return self.model(
+        Set model.use_kivi_cache = True to auto-inject KIVI cache.
+        """
+        use_cache_flag = use_cache if use_cache is not None else self.config.use_cache
+        
+        # Auto-inject KIVI cache if enabled
+        if self.use_kivi_cache and self.use_kivi and use_cache_flag:
+            if past_key_values is None or not isinstance(past_key_values, KIVICache):
+                past_key_values = self.create_kivi_cache()
+        
+        return super().forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -390,71 +539,153 @@ class QwenKIVIWrapper(nn.Module):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            cache_position=cache_position,
             **kwargs,
         )
     
-    def generate(self, *args, **kwargs):
-        """Generate with KIVI cache."""
-        if 'past_key_values' not in kwargs or kwargs['past_key_values'] is None:
-            kwargs['past_key_values'] = self.create_kivi_cache()
-        if 'use_cache' not in kwargs:
-            kwargs['use_cache'] = True
-        return self.model.generate(*args, **kwargs)
+    def generate(
+        self,
+        inputs=None,
+        generation_config=None,
+        logits_processor=None,
+        stopping_criteria=None,
+        prefix_allowed_tokens_fn=None,
+        synced_gpus=None,
+        assistant_model=None,
+        streamer=None,
+        negative_prompt_ids=None,
+        negative_prompt_attention_mask=None,
+        **kwargs,
+    ):
+        """
+        Generate with optional auto-injection of KIVI cache.
+        
+        Set model.use_kivi_cache = True to auto-inject KIVI cache.
+        """
+        # Auto-inject KIVI cache if enabled
+        if self.use_kivi_cache and self.use_kivi:
+            if kwargs.get('past_key_values') is None or not isinstance(kwargs.get('past_key_values'), KIVICache):
+                kwargs['past_key_values'] = self.create_kivi_cache()
+                print(f"[KIVI] Auto-created KIVICache (k={self.k_bits}bit, v={self.v_bits}bit)")
+            
+            if 'use_cache' not in kwargs:
+                kwargs['use_cache'] = True
+        
+        return super().generate(
+            inputs=inputs,
+            generation_config=generation_config,
+            logits_processor=logits_processor,
+            stopping_criteria=stopping_criteria,
+            prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
+            synced_gpus=synced_gpus,
+            assistant_model=assistant_model,
+            streamer=streamer,
+            negative_prompt_ids=negative_prompt_ids,
+            negative_prompt_attention_mask=negative_prompt_attention_mask,
+            **kwargs,
+        )
     
-    def __getattr__(self, name):
-        """Forward attribute access to wrapped model."""
-        try:
-            return super().__getattr__(name)
-        except AttributeError:
-            return getattr(self.model, name)
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        """
+        Load pretrained model with KIVI support.
+        
+        KIVI parameters can be set via config:
+            config = Qwen2KIVIConfig.from_pretrained(model_path)
+            config.k_bits = 2
+            config.v_bits = 2
+            model = Qwen2ForCausalLM_KIVI.from_pretrained(model_path, config=config)
+        
+        Or via kwargs:
+            model = Qwen2ForCausalLM_KIVI.from_pretrained(
+                model_path,
+                k_bits=2,
+                v_bits=2,
+            )
+        """
+        config = kwargs.get('config')
+        
+        if config is None:
+            # Load config and convert to KIVI config
+            config = Qwen2KIVIConfig.from_pretrained(pretrained_model_name_or_path)
+        elif not isinstance(config, Qwen2KIVIConfig):
+            # Convert to KIVI config
+            config_dict = config.to_dict()
+            config = Qwen2KIVIConfig(**config_dict)
+        
+        # Apply KIVI parameters from kwargs
+        if 'k_bits' in kwargs:
+            config.k_bits = kwargs.pop('k_bits')
+        if 'v_bits' in kwargs:
+            config.v_bits = kwargs.pop('v_bits')
+        if 'group_size' in kwargs:
+            config.group_size = kwargs.pop('group_size')
+        if 'residual_length' in kwargs:
+            config.residual_length = kwargs.pop('residual_length')
+        if 'use_kivi' in kwargs:
+            config.use_kivi = kwargs.pop('use_kivi')
+        
+        kwargs['config'] = config
+        
+        return super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
 
 
 # ============================================================================
-# Utility functions
+# Utility Functions
 # ============================================================================
 
-def get_kivi_memory_savings(
-    seq_length: int,
+def load_qwen_kivi(
+    model_name_or_path: str,
     k_bits: int = 2,
     v_bits: int = 2,
+    group_size: int = 32,
     residual_length: int = 128,
-) -> Dict[str, float]:
+    torch_dtype: torch.dtype = torch.float16,
+    device_map: str = "auto",
+    **kwargs,
+) -> Tuple[Qwen2ForCausalLM_KIVI, Any]:
     """
-    Calculate memory savings from KIVI quantization.
+    Load Qwen model with KIVI cache support.
     
     Args:
-        seq_length: Total sequence length
-        k_bits, v_bits: Quantization bits
+        model_name_or_path: Model path or name
+        k_bits: Key quantization bits
+        v_bits: Value quantization bits
+        group_size: Quantization group size
         residual_length: Full precision residual length
+        torch_dtype: Model dtype
+        device_map: Device placement
+        **kwargs: Additional arguments for from_pretrained
         
     Returns:
-        Dictionary with memory statistics
+        model: Qwen2ForCausalLM_KIVI
+        tokenizer: Tokenizer
     """
-    if seq_length <= residual_length:
-        quant_len = 0
-        residual_len = seq_length
-    else:
-        quant_len = seq_length - residual_length
-        residual_len = residual_length
+    from transformers import AutoTokenizer
     
-    # Full precision bits
-    fp16_bits = 16
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
     
-    # Average bits per element
-    avg_k_bits = (quant_len * k_bits + residual_len * fp16_bits) / seq_length
-    avg_v_bits = (quant_len * v_bits + residual_len * fp16_bits) / seq_length
-    avg_bits = (avg_k_bits + avg_v_bits) / 2
+    model = Qwen2ForCausalLM_KIVI.from_pretrained(
+        model_name_or_path,
+        k_bits=k_bits,
+        v_bits=v_bits,
+        group_size=group_size,
+        residual_length=residual_length,
+        torch_dtype=torch_dtype,
+        device_map=device_map,
+        trust_remote_code=True,
+        **kwargs,
+    )
     
-    return {
-        "seq_length": seq_length,
-        "quantized_tokens": quant_len,
-        "residual_tokens": residual_len,
-        "k_bits_avg": f"{avg_k_bits:.2f}",
-        "v_bits_avg": f"{avg_v_bits:.2f}",
-        "total_bits_avg": f"{avg_bits:.2f}",
-        "memory_ratio": f"{avg_bits / fp16_bits:.2%}",
-        "compression_ratio": f"{fp16_bits / avg_bits:.2f}x",
-    }
+    print(f"[KIVI] Loaded {model_name_or_path} with KIVI support")
+    print(f"[KIVI] k_bits={k_bits}, v_bits={v_bits}, group_size={group_size}, residual={residual_length}")
+    
+    return model, tokenizer
+
+
+def get_kivi_memory_stats(cache: KIVICache) -> Dict[str, Any]:
+    """Get KIVI cache memory statistics."""
+    return cache.get_cache_info()
 
 
 def print_kivi_stats(cache: KIVICache):
@@ -473,10 +704,14 @@ def print_kivi_stats(cache: KIVICache):
 # ============================================================================
 
 __all__ = [
+    "Qwen2KIVIConfig",
+    "Qwen2ForCausalLM_KIVI",
+    "Qwen2KIVIModel",
+    "Qwen2KIVISdpaAttention",
+    "Qwen2KIVIFlashAttention2",
+    "Qwen2KIVIDecoderLayer",
     "KIVICache",
-    "load_qwen_with_kivi",
-    "patch_qwen_model",
-    "QwenKIVIWrapper",
-    "get_kivi_memory_savings",
+    "load_qwen_kivi",
+    "get_kivi_memory_stats",
     "print_kivi_stats",
 ]
