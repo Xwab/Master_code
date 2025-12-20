@@ -51,8 +51,12 @@ logger = logging.get_logger(__name__)
 class LlamaKIVIConfig(LlamaConfig):
     """
     Configuration for Llama with KIVI quantized KV cache.
+    
+    Note: We keep model_type = "llama" to avoid warnings when loading pretrained models.
+    KIVI is identified by the presence of k_bits/v_bits attributes.
     """
-    model_type = "llama_kivi"
+    # Keep original model_type to avoid "model type mismatch" warnings
+    model_type = "llama"
     
     def __init__(
         self,
@@ -151,42 +155,58 @@ class LlamaKIVISdpaAttention(LlamaSdpaAttention):
             cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
         
-        # Update KV cache or apply KIVI quantization directly
+        # KIVI cache handling - following official KIVI implementation
+        # Key insight: prefill uses full precision, quantization only affects storage
+        
+        # Save original K/V for prefill attention (before any quantization)
+        key_states_for_attn = key_states
+        value_states_for_attn = value_states
+        
         if past_key_value is not None:
-            # KIVICache.update() handles quantization automatically
-            # Input: [batch, heads, seq_len, head_dim]
-            # Returns: quantized/dequantized key_states, value_states
-            key_states, value_states = past_key_value.update(
-                key_states, value_states, self.layer_idx, cache_kwargs=None
-            )
+            # Check if this is prefill (cache is empty) or decode (cache has data)
+            is_prefill = past_key_value.get_seq_length(self.layer_idx) == 0
+            
+            if is_prefill:
+                # PREFILL: Use original FP16 K/V for attention, then store quantized
+                # This matches official KIVI behavior
+                key_states_for_attn = key_states
+                value_states_for_attn = value_states
+                
+                # Update cache (quantize for storage, but don't use quantized for current attention)
+                _, _ = past_key_value.update(
+                    key_states, value_states, self.layer_idx, cache_kwargs=None
+                )
+            else:
+                # DECODE: Get cached K/V (includes quantized history + new token)
+                key_states_for_attn, value_states_for_attn = past_key_value.update(
+                    key_states, value_states, self.layer_idx, cache_kwargs=None
+                )
         elif self.use_kivi:
-            # No cache but still apply KIVI quantization
-            # Key: per-channel quantization (along token dimension)
-            # Value: per-token quantization (along head_dim dimension)
-            key_states = self.key_quantizer(key_states)
-            value_states = self.value_quantizer(value_states)
+            # No cache but still apply KIVI quantization (for evaluation without generate)
+            key_states_for_attn = self.key_quantizer(key_states)
+            value_states_for_attn = self.value_quantizer(value_states)
         
         # Repeat K/V for GQA
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        key_states_for_attn = repeat_kv(key_states_for_attn, self.num_key_value_groups)
+        value_states_for_attn = repeat_kv(value_states_for_attn, self.num_key_value_groups)
         
         # Prepare attention mask
         causal_mask = attention_mask
         if attention_mask is not None:
-            causal_mask = causal_mask[:, :, :, :key_states.shape[-2]]
+            causal_mask = causal_mask[:, :, :, :key_states_for_attn.shape[-2]]
         
         # SDPA
         if query_states.device.type == "cuda" and causal_mask is not None:
             query_states = query_states.contiguous()
-            key_states = key_states.contiguous()
-            value_states = value_states.contiguous()
+            key_states_for_attn = key_states_for_attn.contiguous()
+            value_states_for_attn = value_states_for_attn.contiguous()
         
         is_causal = True if causal_mask is None and q_len > 1 else False
         
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             query_states,
-            key_states,
-            value_states,
+            key_states_for_attn,
+            value_states_for_attn,
             attn_mask=causal_mask,
             dropout_p=self.attention_dropout if self.training else 0.0,
             is_causal=is_causal,
@@ -265,20 +285,41 @@ class LlamaKIVIFlashAttention2(LlamaFlashAttention2):
             cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
         
-        # Update KV cache or apply KIVI quantization directly
+        # KIVI cache handling - following official KIVI implementation
+        # Key insight: prefill uses full precision, quantization only affects storage
+        
+        # Save original K/V for prefill attention (before any quantization)
+        key_states_for_attn = key_states
+        value_states_for_attn = value_states
+        
         if past_key_value is not None:
-            key_states, value_states = past_key_value.update(
-                key_states, value_states, self.layer_idx, cache_kwargs=None
-            )
+            # Check if this is prefill (cache is empty) or decode (cache has data)
+            is_prefill = past_key_value.get_seq_length(self.layer_idx) == 0
+            
+            if is_prefill:
+                # PREFILL: Use original FP16 K/V for attention, then store quantized
+                # This matches official KIVI behavior
+                key_states_for_attn = key_states
+                value_states_for_attn = value_states
+                
+                # Update cache (quantize for storage, but don't use quantized for current attention)
+                _, _ = past_key_value.update(
+                    key_states, value_states, self.layer_idx, cache_kwargs=None
+                )
+            else:
+                # DECODE: Get cached K/V (includes quantized history + new token)
+                key_states_for_attn, value_states_for_attn = past_key_value.update(
+                    key_states, value_states, self.layer_idx, cache_kwargs=None
+                )
         elif self.use_kivi:
-            # No cache but still apply KIVI quantization
-            key_states = self.key_quantizer(key_states)
-            value_states = self.value_quantizer(value_states)
+            # No cache but still apply KIVI quantization (for evaluation without generate)
+            key_states_for_attn = self.key_quantizer(key_states)
+            value_states_for_attn = self.value_quantizer(value_states)
         
         # Flash attention requires [bsz, seq_len, num_heads, head_dim]
         query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
+        key_states_for_attn = key_states_for_attn.transpose(1, 2)
+        value_states_for_attn = value_states_for_attn.transpose(1, 2)
         
         dropout_rate = self.attention_dropout if self.training else 0.0
         
@@ -299,16 +340,16 @@ class LlamaKIVIFlashAttention2(LlamaFlashAttention2):
             )
             
             query_states = query_states.to(target_dtype)
-            key_states = key_states.to(target_dtype)
-            value_states = value_states.to(target_dtype)
+            key_states_for_attn = key_states_for_attn.to(target_dtype)
+            value_states_for_attn = value_states_for_attn.to(target_dtype)
         
         # Import flash attention
         from transformers.modeling_flash_attention_utils import _flash_attention_forward
         
         attn_output = _flash_attention_forward(
             query_states,
-            key_states,
-            value_states,
+            key_states_for_attn,
+            value_states_for_attn,
             attention_mask,
             q_len,
             position_ids=position_ids,
