@@ -96,12 +96,13 @@ class KIVIQuantizer(nn.Module):
             x_min = x_grouped.amin(dim=-1, keepdim=True)
             x_max = x_grouped.amax(dim=-1, keepdim=True)
             scale = (x_max - x_min).clamp(min=1e-5) / self.q_max
+            # zero_point should NOT be clamped - it can be any value
+            # zero_point = -x_min / scale (mathematically equivalent to using x_min directly)
+            zero_point = -x_min / scale
             
-            # Quantize and dequantize using correct min-max formula
-            # x_quant = ((x - x_min) / scale).round().clamp(0, q_max)
-            # x_dequant = x_quant * scale + x_min
-            x_quant = ((x_grouped - x_min) / scale).round().clamp(self.q_min, self.q_max)
-            x_dequant = x_quant * scale + x_min
+            # Quantize and dequantize
+            x_quant = (x_grouped / scale + zero_point).round().clamp(self.q_min, self.q_max)
+            x_dequant = (x_quant - zero_point) * scale
             
             # Reshape back
             x_dequant = x_dequant.view(*leading_dims, actual_dim)
@@ -113,10 +114,11 @@ class KIVIQuantizer(nn.Module):
             x_min = x.amin(dim=-1, keepdim=True)
             x_max = x.amax(dim=-1, keepdim=True)
             scale = (x_max - x_min).clamp(min=1e-5) / self.q_max
+            # zero_point should NOT be clamped
+            zero_point = -x_min / scale
             
-            # Quantize and dequantize using correct min-max formula
-            x_quant = ((x - x_min) / scale).round().clamp(self.q_min, self.q_max)
-            x_dequant = x_quant * scale + x_min
+            x_quant = (x / scale + zero_point).round().clamp(self.q_min, self.q_max)
+            x_dequant = (x_quant - zero_point) * scale
         
         # Transpose back for per-channel
         if self.per_channel:
