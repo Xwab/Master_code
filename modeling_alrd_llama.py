@@ -13,8 +13,37 @@ from transformers.modeling_outputs import (
 )
 from typing import List, Optional, Tuple, Union
 from transformers.cache_utils import DynamicCache, StaticCache
-from modules.quant_utils import Quantizer, Quantizer2, quantize_tensor_forward
+from modules.quant_utils import (
+    Quantizer, Quantizer2, quantize_tensor_forward,
+    KIVIKeyQuantizer, KIVIValueQuantizer, KIVIMixedQuantizer,
+    kivi_quantize_per_channel, kivi_quantize_per_token
+)
 from modules.hadamard_utils import apply_hadamard
+from modules.kivi_cache import KIVILatentCache, create_kivi_cache
+from modules.kivi_mixed_cache import (
+    KIVIMixedPrecisionQuantizer,
+    ALRDLinear_KIVI_Value_FullRank_Mixed,
+    KIVIMixedPrecisionCache,
+    create_mixed_precision_cache,
+    calculate_mixed_precision_split,
+)
+from modules.kivi_mixed_cache_v2 import (
+    KIVIKeyQuantizerV2,
+    KIVIMixedValueQuantizerV2,
+    ALRDLinear_KIVI_Value_FullRank_MixedV2,
+    KIVIMixedPrecisionCacheV2,
+    create_mixed_precision_cache_v2,
+    calculate_mixed_precision_split_v2,
+)
+from modules.int8_matmul import (
+    Int8Linear,
+    Int8ValueReconstructor,
+    create_int8_value_reconstructor,
+    INT8_SUPPORTED,
+)
+
+# Union type for all KIVI-style caches
+KIVI_CACHE_TYPES = (KIVILatentCache, KIVIMixedPrecisionCache, KIVIMixedPrecisionCacheV2)
 logger = logging.get_logger(__name__)
 
 
@@ -22,9 +51,26 @@ logger = logging.get_logger(__name__)
 class CustomLlamaSdpaAttention(LlamaSdpaAttention):
     def __init__(self, config, layer_idx=None):
         super().__init__(config, layer_idx)
-        self.quantizer = Quantizer(n_bits=8, group_size= 0, sym = True, clip_ratio = 1.0)
-        #self.q_max = (2**(32-1)-1)
-        #self.q_min = (-2**(32-1))
+        # KIVI-style quantizer for ALinear weight (fallback)
+        self.a_weight_bits = getattr(config, 'a_weight_bits', 8)
+        self.a_weight_group_size = getattr(config, 'a_weight_group_size', 128)
+        self.quantizer = KIVIValueQuantizer(
+            n_bits=self.a_weight_bits, 
+            group_size=self.a_weight_group_size
+        )
+        
+        # INT8 reconstruction option
+        self.use_int8_reconstruction = getattr(config, 'use_int8_reconstruction', False)
+        self.int8_value_reconstructor = None  # Will be initialized after v_proj is set
+    
+    def setup_int8_reconstruction(self):
+        """Setup INT8 reconstruction for value. Call after v_proj is set."""
+        if hasattr(self, 'v_proj') and hasattr(self.v_proj, 'ALinear'):
+            self.int8_value_reconstructor = Int8ValueReconstructor.from_linear(
+                self.v_proj.ALinear
+            )
+            self.use_int8_reconstruction = True
+            print(f"[INT8] Layer {self.layer_idx}: Setup INT8 value reconstruction")
 
     def forward(
             self,
@@ -60,35 +106,40 @@ class CustomLlamaSdpaAttention(LlamaSdpaAttention):
         bsz, q_len, _ = hidden_states.size()
         query_states = self.q_proj(hidden_states)
         
+        # Check if using KIVI cache (handles quantization internally)
+        # Supports both standard KIVILatentCache and KIVIMixedPrecisionCache
+        use_kivi_cache = isinstance(past_key_value, KIVI_CACHE_TYPES)
 
-        key_states = self.k_proj.BLinear(hidden_states)#[:,:,:k_rank]
-        key_states = self.k_proj.quantize_latent_mixed(key_states)
-        #key_states = self.k_proj.quantize_latent(key_states) ##quant latent
-        #key_states = self.k_proj.quantize_latent_mixed(key_states) ##quant latent
-        value_states = self.v_proj.BLinear(hidden_states)#[:,:,:v_rank]
-        #value_states = self.v_proj.quantize_latent(value_states) ##quant latent
-        #value_states = self.v_proj.quantize_latent_mixed(value_states) ##quant latent
+        # Compute low-rank latent representations
+        key_latent = self.k_proj.BLinear(hidden_states)  # [bsz, q_len, rank]
+        value_latent = self.v_proj.BLinear(hidden_states)  # [bsz, q_len, rank]
         
-
-        #value_states_high, value_states_low, B_sacles_high, B_sacles_low = self.v_proj.quantize_latent_mixed(value_states)
-        value_states = self.v_proj.quantize_latent_mixed(value_states)
-       
+        if use_kivi_cache:
+            # KIVI cache handles quantization internally with per-channel/per-token scheme
+            # and maintains residual (recent tokens in full precision)
+            key_states, value_states = past_key_value.update(key_latent, value_latent, self.layer_idx)
+        else:
+            # Legacy path: use external quantization
+            key_states = self.k_proj.quantize_latent_mixed(key_latent)
+            value_states = self.v_proj.quantize_latent_mixed(value_latent)
+            
+            if past_key_value is not None:
+                # Update with standard DynamicCache
+                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx)
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            #key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx)
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx)
-        #A_weight_partial_k = self.k_proj.ALinear.weight.data[:,:k_rank]
-        #A_weight_partial_v = self.v_proj.ALinear.weight.data[:,:k_rank]
-        #key_states = torch.matmul(key_states, A_weight_partial_k.t())
-        #value_states = torch.matmul(value_states, A_weight_partial_v.t())
+        # Restore full dimension from low-rank latent
         key_states = self.k_proj.ALinear(key_states)
-        quantized_value_A_Linear = self.quantizer(self.v_proj.ALinear.weight.data)
-        #quantized_value_A_Linear_high = quantized_value_A_Linear[:, :high_bit_rank_num]
-        #quantized_value_A_Linear_low = quantized_value_A_Linear[:, high_bit_rank_num:]
-        value_states = torch.matmul(value_states, quantized_value_A_Linear.t())
+        
+        # Value reconstruction: use INT8 matmul if enabled, otherwise use quantized FP16
+        if self.use_int8_reconstruction and self.int8_value_reconstructor is not None:
+            # W8A8 INT8 matmul for value reconstruction
+            value_states = self.int8_value_reconstructor(value_states)
+        else:
+            # Fallback: quantize ALinear weight and use FP16 matmul
+            quantized_value_A_Linear = self.quantizer(self.v_proj.ALinear.weight.data)
+            value_states = torch.matmul(value_states, quantized_value_A_Linear.t())
 
         #value_states_high = value_states[:, :, :high_bit_rank_num]
         #value_states_high = torch.matmul(value_states_high.to(torch.float32), quantized_value_A_Linear_high.t().to(torch.float32))
@@ -160,14 +211,35 @@ class CustomLlamaFlashAttention2(LlamaFlashAttention2):
     flash attention and deal with padding tokens in case the input contains any of them.
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, config, layer_idx=None):
+        super().__init__(config, layer_idx)
 
         # TODO: Should be removed once Flash Attention for RoCm is bumped to 2.1.
         # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignement, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
         # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).
         self._flash_attn_uses_top_left_mask = True#not is_flash_attn_greater_or_equal_2_10()
-        self.quantizer = Quantizer(n_bits=8, group_size= 0, sym = True, clip_ratio = 1.0)
+        
+        # KIVI-style quantizer for ALinear weight (fallback)
+        self.a_weight_bits = getattr(config, 'a_weight_bits', 8)
+        self.a_weight_group_size = getattr(config, 'a_weight_group_size', 128)
+        self.quantizer = KIVIValueQuantizer(
+            n_bits=self.a_weight_bits, 
+            group_size=self.a_weight_group_size
+        )
+        
+        # INT8 reconstruction option
+        self.use_int8_reconstruction = getattr(config, 'use_int8_reconstruction', False)
+        self.int8_value_reconstructor = None  # Will be initialized after v_proj is set
+    
+    def setup_int8_reconstruction(self):
+        """Setup INT8 reconstruction for value. Call after v_proj is set."""
+        if hasattr(self, 'v_proj') and hasattr(self.v_proj, 'ALinear'):
+            self.int8_value_reconstructor = Int8ValueReconstructor.from_linear(
+                self.v_proj.ALinear
+            )
+            self.use_int8_reconstruction = True
+            print(f"[INT8] Layer {self.layer_idx}: Setup INT8 value reconstruction (FlashAttn)")
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -194,24 +266,42 @@ class CustomLlamaFlashAttention2(LlamaFlashAttention2):
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj.BLinear(hidden_states)
-        key_states = self.k_proj.quantize_latent(key_states)
-        value_states = self.v_proj.BLinear(hidden_states)
-        value_states = self.v_proj.quantize_latent(value_states)
+        
+        # Check if using KIVI cache (handles quantization internally)
+        # Supports both standard KIVILatentCache and KIVIMixedPrecisionCache
+        use_kivi_cache = isinstance(past_key_value, KIVI_CACHE_TYPES)
+        
+        # Compute low-rank latent representations
+        key_latent = self.k_proj.BLinear(hidden_states)  # [bsz, q_len, rank]
+        value_latent = self.v_proj.BLinear(hidden_states)  # [bsz, q_len, rank]
+        
+        if use_kivi_cache:
+            # KIVI cache handles quantization internally with per-channel/per-token scheme
+            key_states, value_states = past_key_value.update(key_latent, value_latent, self.layer_idx)
+        else:
+            # Legacy path: use external quantization
+            key_states = self.k_proj.quantize_latent(key_latent)
+            value_states = self.v_proj.quantize_latent(value_latent)
+            
+            if past_key_value is not None:
+                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx)
 
         # Flash attention requires the input to have the shape
         # batch_size x seq_length x head_dim x hidden_dim
         # therefore we just need to keep the original shape
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            #key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx)
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx)
-
+        # Restore full dimension from low-rank latent
         key_states = self.k_proj.ALinear(key_states)
-        quantized_value_A_Linear = self.quantizer(self.v_proj.ALinear.weight.data)
-        value_states = torch.matmul(value_states, quantized_value_A_Linear.t())
+        
+        # Value reconstruction: use INT8 matmul if enabled, otherwise use quantized FP16
+        if self.use_int8_reconstruction and self.int8_value_reconstructor is not None:
+            # W8A8 INT8 matmul for value reconstruction
+            value_states = self.int8_value_reconstructor(value_states)
+        else:
+            # Fallback: quantize ALinear weight and use FP16 matmul
+            quantized_value_A_Linear = self.quantizer(self.v_proj.ALinear.weight.data)
+            value_states = torch.matmul(value_states, quantized_value_A_Linear.t())
 
         _, k_len, _ = key_states.size()
         key_states = key_states.view(bsz, k_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -915,6 +1005,449 @@ class ALRDLinear_quant(nn.Module):
        #return self.ALinear(self.BLinear(input))
 
 
+# ============================================================================
+# KIVI-style Low-Rank Linear Layers
+# ============================================================================
+
+class ALRDLinear_KIVI_Key(nn.Module):
+    """
+    Low-rank linear layer with KIVI-style per-channel quantization for Key.
+    
+    Key cache is quantized per-channel (along the token dimension), which 
+    preserves the variance structure that is important for attention computation.
+    """
+    
+    def __init__(
+        self, 
+        in_features: int, 
+        out_features: int, 
+        rank: int, 
+        bias: bool = True,
+        k_bits: int = 2,
+        group_size: int = 128,
+        residual_length: int = 32,
+    ):
+        super().__init__()
+        self.BLinear = nn.Linear(in_features, rank, bias=False)
+        self.ALinear = nn.Linear(rank, out_features, bias=bias)
+        self.rank = rank
+        self.in_features = in_features
+        self.out_features = out_features
+        
+        # KIVI-style quantizer: per-channel for Key
+        self.kivi_quantizer = KIVIMixedQuantizer(
+            n_bits=k_bits,
+            group_size=group_size,
+            residual_length=residual_length,
+            per_channel=True,  # Key uses per-channel quantization
+        )
+        
+        # KIVI-style quantizer (per-channel for Key)
+        self.quantizer = KIVIKeyQuantizer(n_bits=k_bits, group_size=group_size)
+        
+        # For Hadamard transform
+        self.rank_lists = self._split_rank_for_hada(rank)
+    
+    def _split_rank_for_hada(self, rank):
+        """Split rank into chunks suitable for Hadamard transform (power of 2)."""
+        def is_pow2(n):
+            return (n & (n - 1) == 0) and (n > 0)
+        
+        hada_list = []
+        rank_lists = [1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1]
+        res_rank = rank
+        for item in rank_lists:
+            if item == 1 or res_rank == 1 or res_rank == 0:
+                break
+            if is_pow2(res_rank):
+                hada_list.append(res_rank)
+                break
+            while res_rank >= item:
+                times = res_rank // item
+                if is_pow2(times):
+                    hada_list.append(times * item)
+                    res_rank = res_rank % item
+                else:
+                    hada_list.append(item)
+                    res_rank = res_rank - item
+        return hada_list
+    
+    def fuse_hadamard(self):
+        """Apply Hadamard transform to BLinear and ALinear weights for better quantization."""
+        def hadamard_transform(x):
+            n = x.size(1)
+            if n & (n - 1) != 0:
+                raise ValueError("Input size must be a power of 2.")
+            H = torch.tensor([[1, 1], [1, -1]], dtype=x.dtype).to(x.device)
+            for i in range(1, int(n.bit_length()-1)):
+                H = torch.kron(H, torch.tensor([[1, 1], [1, -1]], dtype=x.dtype).to(H.device))
+            return torch.matmul(x, H) / torch.tensor(n, dtype=x.dtype).sqrt()
+        
+        VT_weight = self.BLinear.weight.data
+        U_weight = self.ALinear.weight.data
+        total_rank = 0
+        
+        print(f"ALRDLinear_KIVI_Key fuse_hadamard: rank={self.rank}, rank_lists={self.rank_lists}")
+        
+        for rank in self.rank_lists:
+            # Transform BLinear (VT)
+            VT_chunk = VT_weight[total_rank:total_rank + rank, :].contiguous()
+            VT_chunk = VT_chunk.transpose(0, 1).contiguous()
+            VT_chunk = VT_chunk.view(-1, VT_chunk.shape[-1]).contiguous()
+            VT_chunk = hadamard_transform(VT_chunk)
+            self.BLinear.weight.data[total_rank:total_rank + rank, :] = VT_chunk.t()
+            
+            # Transform ALinear (U)
+            U_chunk = U_weight[:, total_rank:total_rank + rank].contiguous()
+            U_chunk = U_chunk.view(-1, U_chunk.shape[-1]).contiguous()
+            U_chunk = hadamard_transform(U_chunk)
+            self.ALinear.weight.data[:, total_rank:total_rank + rank] = U_chunk.view_as(
+                self.ALinear.weight.data[:, total_rank:total_rank + rank]
+            )
+            
+            total_rank += rank
+    
+    def quantize_latent(self, latents: torch.Tensor) -> torch.Tensor:
+        """Simple quantization without residual."""
+        x_quant, _, _ = kivi_quantize_per_channel(
+            latents, 
+            self.kivi_quantizer.n_bits, 
+            self.kivi_quantizer.group_size
+        )
+        return x_quant
+    
+    def quantize_latent_mixed(self, latents: torch.Tensor) -> torch.Tensor:
+        """KIVI-style quantization with residual (recent tokens in full precision)."""
+        return self.kivi_quantizer(latents)
+    
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        y = self.BLinear(input)
+        y = self.quantize_latent(y)
+        return self.ALinear(y)
+
+
+class ALRDLinear_KIVI_Value(nn.Module):
+    """
+    Low-rank linear layer with KIVI-style per-token quantization for Value.
+    
+    Value cache is quantized per-token (along the hidden dimension), which
+    works better for the weighted sum operation in attention.
+    """
+    
+    def __init__(
+        self, 
+        in_features: int, 
+        out_features: int, 
+        rank: int, 
+        bias: bool = True,
+        v_bits: int = 2,
+        group_size: int = 128,
+        residual_length: int = 32,
+    ):
+        super().__init__()
+        self.BLinear = nn.Linear(in_features, rank, bias=False)
+        self.ALinear = nn.Linear(rank, out_features, bias=bias)
+        self.rank = rank
+        self.in_features = in_features
+        self.out_features = out_features
+        
+        # KIVI-style quantizer: per-token for Value
+        self.kivi_quantizer = KIVIMixedQuantizer(
+            n_bits=v_bits,
+            group_size=group_size,
+            residual_length=residual_length,
+            per_channel=False,  # Value uses per-token quantization
+        )
+        
+        # KIVI-style quantizer (per-token for Value)
+        self.quantizer = KIVIValueQuantizer(n_bits=v_bits, group_size=group_size)
+        
+        # For Hadamard transform
+        self.rank_lists = self._split_rank_for_hada(rank)
+    
+    def _split_rank_for_hada(self, rank):
+        """Split rank into chunks suitable for Hadamard transform (power of 2)."""
+        def is_pow2(n):
+            return (n & (n - 1) == 0) and (n > 0)
+        
+        hada_list = []
+        rank_lists = [1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1]
+        res_rank = rank
+        for item in rank_lists:
+            if item == 1 or res_rank == 1 or res_rank == 0:
+                break
+            if is_pow2(res_rank):
+                hada_list.append(res_rank)
+                break
+            while res_rank >= item:
+                times = res_rank // item
+                if is_pow2(times):
+                    hada_list.append(times * item)
+                    res_rank = res_rank % item
+                else:
+                    hada_list.append(item)
+                    res_rank = res_rank - item
+        return hada_list
+    
+    def fuse_hadamard(self):
+        """Apply Hadamard transform to BLinear and ALinear weights for better quantization."""
+        def hadamard_transform(x):
+            n = x.size(1)
+            if n & (n - 1) != 0:
+                raise ValueError("Input size must be a power of 2.")
+            H = torch.tensor([[1, 1], [1, -1]], dtype=x.dtype).to(x.device)
+            for i in range(1, int(n.bit_length()-1)):
+                H = torch.kron(H, torch.tensor([[1, 1], [1, -1]], dtype=x.dtype).to(H.device))
+            return torch.matmul(x, H) / torch.tensor(n, dtype=x.dtype).sqrt()
+        
+        VT_weight = self.BLinear.weight.data
+        U_weight = self.ALinear.weight.data
+        total_rank = 0
+        
+        print(f"ALRDLinear_KIVI_Value fuse_hadamard: rank={self.rank}, rank_lists={self.rank_lists}")
+        
+        for rank in self.rank_lists:
+            # Transform BLinear (VT)
+            VT_chunk = VT_weight[total_rank:total_rank + rank, :].contiguous()
+            VT_chunk = VT_chunk.transpose(0, 1).contiguous()
+            VT_chunk = VT_chunk.view(-1, VT_chunk.shape[-1]).contiguous()
+            VT_chunk = hadamard_transform(VT_chunk)
+            self.BLinear.weight.data[total_rank:total_rank + rank, :] = VT_chunk.t()
+            
+            # Transform ALinear (U)
+            U_chunk = U_weight[:, total_rank:total_rank + rank].contiguous()
+            U_chunk = U_chunk.view(-1, U_chunk.shape[-1]).contiguous()
+            U_chunk = hadamard_transform(U_chunk)
+            self.ALinear.weight.data[:, total_rank:total_rank + rank] = U_chunk.view_as(
+                self.ALinear.weight.data[:, total_rank:total_rank + rank]
+            )
+            
+            total_rank += rank
+    
+    def quantize_latent(self, latents: torch.Tensor) -> torch.Tensor:
+        """Simple quantization without residual."""
+        x_quant, _, _ = kivi_quantize_per_token(
+            latents, 
+            self.kivi_quantizer.n_bits, 
+            self.kivi_quantizer.group_size
+        )
+        return x_quant
+    
+    def quantize_latent_mixed(self, latents: torch.Tensor) -> torch.Tensor:
+        """KIVI-style quantization with residual (recent tokens in full precision)."""
+        return self.kivi_quantizer(latents)
+    
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        y = self.BLinear(input)
+        y = self.quantize_latent(y)
+        return self.ALinear(y)
+
+
+class ALRDLinear_KIVI_Value_Mixed(nn.Module):
+    """
+    Low-rank linear layer with mixed-precision KIVI quantization for Value.
+    
+    This class implements mixed 4bit/2bit quantization based on singular value importance:
+    - Features with larger singular values (more important) → 4bit
+    - Features with smaller singular values (less important) → 2bit
+    
+    The split is determined by the target compression ratio:
+    - target_ratio: user-specified target compression ratio (r1)
+    - lowrank_ratio: rank / out_features (r2) 
+    - final_ratio: r1 * r2 (should be >= 0.125 for 2bit minimum)
+    
+    Compression calculation:
+    - n_4bit = out_features * (8 * final_ratio - 1)
+    - n_2bit = out_features - n_4bit
+    - Average bits = (4 * n_4bit + 2 * n_2bit) / out_features
+    """
+    
+    def __init__(
+        self, 
+        in_features: int, 
+        out_features: int, 
+        rank: int, 
+        bias: bool = True,
+        target_ratio: float = 0.25,  # Target compression ratio (r1)
+        group_size: int = 128,
+        residual_length: int = 32,
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank = rank
+        self.group_size = group_size
+        self.residual_length = residual_length
+        
+        # BLinear outputs full out_features (not rank)
+        # This allows mixed-precision quantization on full feature space
+        self.BLinear = nn.Linear(in_features, out_features, bias=False)
+        self.ALinear = nn.Linear(out_features, out_features, bias=bias)
+        
+        # For Hadamard transform - use out_features since that's the latent dimension
+        self.rank_lists = self._split_rank_for_hada(out_features)
+        
+        # Calculate compression ratios
+        self.lowrank_ratio = rank / out_features  # r2
+        self.target_ratio = target_ratio  # r1
+        self.final_ratio = self.target_ratio * self.lowrank_ratio  # r = r1 * r2
+        
+        # Calculate 4bit/2bit split based on final compression ratio
+        # Compression: (4 * n_4bit + 2 * n_2bit) / (16 * out_features) = final_ratio
+        # Solving: n_4bit = out_features * (8 * final_ratio - 1)
+        #          n_2bit = out_features * (2 - 8 * final_ratio)
+        
+        if self.final_ratio <= 0.125:
+            # All 2bit (maximum compression)
+            self.n_4bit = 0
+            self.n_2bit = out_features
+        elif self.final_ratio >= 0.25:
+            # All 4bit (minimum compression for mixed mode)
+            self.n_4bit = out_features
+            self.n_2bit = 0
+        else:
+            # Mixed precision
+            self.n_4bit = int(out_features * (8 * self.final_ratio - 1))
+            self.n_2bit = out_features - self.n_4bit
+        
+        # Ensure alignment to group_size for efficient quantization
+        if group_size > 0:
+            self.n_4bit = (self.n_4bit // group_size) * group_size
+            self.n_2bit = out_features - self.n_4bit
+        
+        # Create KIVI-style quantizers for each precision level (per-token for Value)
+        self.quantizer_4bit = KIVIValueQuantizer(n_bits=4, group_size=group_size)
+        self.quantizer_2bit = KIVIValueQuantizer(n_bits=2, group_size=group_size)
+        
+        # Store actual average bits for logging
+        self.avg_bits = (4 * self.n_4bit + 2 * self.n_2bit) / out_features if out_features > 0 else 0
+        
+        print(f"ALRDLinear_KIVI_Value_Mixed: out_features={out_features}, "
+              f"n_4bit={self.n_4bit}, n_2bit={self.n_2bit}, "
+              f"avg_bits={self.avg_bits:.2f}, final_ratio={self.final_ratio:.4f}")
+    
+    def _split_rank_for_hada(self, rank):
+        """Split rank into chunks suitable for Hadamard transform (power of 2)."""
+        def is_pow2(n):
+            return (n & (n - 1) == 0) and (n > 0)
+        
+        hada_list = []
+        rank_lists = [1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1]
+        res_rank = rank
+        for item in rank_lists:
+            if item == 1 or res_rank == 1 or res_rank == 0:
+                break
+            if is_pow2(res_rank):
+                hada_list.append(res_rank)
+                break
+            while res_rank >= item:
+                times = res_rank // item
+                if is_pow2(times):
+                    hada_list.append(times * item)
+                    res_rank = res_rank % item
+                else:
+                    hada_list.append(item)
+                    res_rank = res_rank - item
+        return hada_list
+    
+    def fuse_hadamard(self):
+        """Apply Hadamard transform to BLinear and ALinear weights for better quantization."""
+        def hadamard_transform(x):
+            n = x.size(1)
+            if n & (n - 1) != 0:
+                raise ValueError("Input size must be a power of 2.")
+            H = torch.tensor([[1, 1], [1, -1]], dtype=x.dtype).to(x.device)
+            for i in range(1, int(n.bit_length()-1)):
+                H = torch.kron(H, torch.tensor([[1, 1], [1, -1]], dtype=x.dtype).to(H.device))
+            return torch.matmul(x, H) / torch.tensor(n, dtype=x.dtype).sqrt()
+        
+        VT_weight = self.BLinear.weight.data
+        U_weight = self.ALinear.weight.data
+        total_rank = 0
+        
+        print(f"ALRDLinear_KIVI_Value_Mixed fuse_hadamard: out_features={self.out_features}, rank_lists={self.rank_lists}")
+        
+        for rank in self.rank_lists:
+            # Transform BLinear (VT)
+            VT_chunk = VT_weight[total_rank:total_rank + rank, :].contiguous()
+            VT_chunk = VT_chunk.transpose(0, 1).contiguous()
+            VT_chunk = VT_chunk.view(-1, VT_chunk.shape[-1]).contiguous()
+            VT_chunk = hadamard_transform(VT_chunk)
+            self.BLinear.weight.data[total_rank:total_rank + rank, :] = VT_chunk.t()
+            
+            # Transform ALinear (U)
+            U_chunk = U_weight[:, total_rank:total_rank + rank].contiguous()
+            U_chunk = U_chunk.view(-1, U_chunk.shape[-1]).contiguous()
+            U_chunk = hadamard_transform(U_chunk)
+            self.ALinear.weight.data[:, total_rank:total_rank + rank] = U_chunk.view_as(
+                self.ALinear.weight.data[:, total_rank:total_rank + rank]
+            )
+            
+            total_rank += rank
+    
+    def quantize_latent(self, latents: torch.Tensor) -> torch.Tensor:
+        """
+        Mixed-precision quantization: 4bit for important features, 2bit for others.
+        
+        Features are assumed to be ordered by singular value importance
+        (largest singular values first), so we apply 4bit to the first n_4bit
+        features and 2bit to the remaining.
+        
+        Args:
+            latents: [batch, seq_len, out_features]
+        
+        Returns:
+            Quantized latents with same shape
+        """
+        if self.n_4bit == self.out_features:
+            # All 4bit
+            return self.quantizer_4bit(latents)
+        elif self.n_4bit == 0:
+            # All 2bit
+            return self.quantizer_2bit(latents)
+        else:
+            # Mixed precision: split, quantize separately, concatenate
+            latents_4bit = latents[..., :self.n_4bit]
+            latents_2bit = latents[..., self.n_4bit:]
+            
+            quant_4bit = self.quantizer_4bit(latents_4bit)
+            quant_2bit = self.quantizer_2bit(latents_2bit)
+            
+            return torch.cat([quant_4bit, quant_2bit], dim=-1)
+    
+    def quantize_latent_mixed(self, latents: torch.Tensor) -> torch.Tensor:
+        """
+        Mixed-precision quantization with residual support.
+        Keep recent tokens in full precision.
+        """
+        seq_len = latents.shape[1]
+        
+        if seq_len <= self.residual_length:
+            # All tokens fit in residual, no quantization
+            return latents
+        
+        # Split into quantized and residual parts
+        n_quant = seq_len - self.residual_length
+        if self.group_size > 0:
+            n_quant = (n_quant // self.group_size) * self.group_size
+        
+        if n_quant <= 0:
+            return latents
+        
+        latents_to_quant = latents[:, :n_quant, :]
+        latents_residual = latents[:, n_quant:, :]
+        
+        # Apply mixed-precision quantization
+        latents_quantized = self.quantize_latent(latents_to_quant)
+        
+        return torch.cat([latents_quantized, latents_residual], dim=1)
+    
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        y = self.BLinear(input)
+        y = self.quantize_latent(y)
+        return self.ALinear(y)
+
+
 class ALRDLlamaForCausalLM(LlamaForCausalLM):
     
     config_class = ALRDLlamaConfig
@@ -923,6 +1456,23 @@ class ALRDLlamaForCausalLM(LlamaForCausalLM):
         super().__init__(config)
         self.truncation_ranks = config.truncation_ranks
         self.model = CustomLlamaModel(config)
+        
+        # KIVI parameters
+        self.use_kivi = getattr(config, 'use_kivi', False)
+        self.k_bits = getattr(config, 'k_bits', 2)
+        self.v_bits = getattr(config, 'v_bits', 2)
+        self.group_size = getattr(config, 'group_size', 128)
+        self.residual_length = getattr(config, 'residual_length', 32)
+        
+        # Mixed-precision Value parameters
+        self.use_mixed_precision_value = getattr(config, 'use_mixed_precision_value', False)
+        self.value_target_ratios = getattr(config, 'value_target_ratios', {})
+        self.default_value_target_ratio = getattr(config, 'default_value_target_ratio', 0.25)
+        
+        # Full-rank mixed-precision Value parameters
+        # When True: keep full rank (D), use 4bit+2bit mixed to match low-rank+3bit compression
+        # This replaces low-rank truncation with full-rank mixed-precision quantization
+        self.use_fullrank_mixed_value = getattr(config, 'use_fullrank_mixed_value', False)
 
         full_name_dict = {module: name for name, module in self.named_modules()}
         linear_info = {}
@@ -941,16 +1491,395 @@ class ALRDLlamaForCausalLM(LlamaForCausalLM):
                     modules.append(raw_linear)
 
         for name, module in self.named_modules():
-            if name in self.truncation_ranks :
+            if name in self.truncation_ranks:
                 info = linear_info[module]
-                if name.endswith('k_proj'):
-                    new_layer = ALRDLinear_quant_key_v2(module.in_features, module.out_features, self.truncation_ranks[name],
-                                        bias=module.bias is not None)
-                elif name.endswith('v_proj'):
-                    new_layer = ALRDLinear_quant_key_v2(module.in_features, module.out_features, self.truncation_ranks[name],
-                                        bias=module.bias is not None)
+                rank = self.truncation_ranks[name]
+                
+                if self.use_kivi:
+                    # Use KIVI-style quantization
+                    if name.endswith('k_proj'):
+                        new_layer = ALRDLinear_KIVI_Key(
+                            module.in_features, 
+                            module.out_features, 
+                            rank,
+                            bias=module.bias is not None,
+                            k_bits=self.k_bits,
+                            group_size=self.group_size,
+                            residual_length=self.residual_length,
+                        )
+                    elif name.endswith('v_proj'):
+                        if self.use_fullrank_mixed_value:
+                            # Full-rank + 4bit/2bit mixed to match low-rank+3bit compression
+                            # This is the user's new scheme:
+                            # - Keep all D features (no truncation)
+                            # - Use 4bit for important features, 2bit for others
+                            # - Match compression: 3r = 4*n_4bit + 2*n_2bit
+                            new_layer = ALRDLinear_KIVI_Value_FullRank_Mixed(
+                                in_features=module.in_features, 
+                                out_features=module.out_features, 
+                                original_rank=rank,  # The rank that would have been used
+                                bias=module.bias is not None,
+                                group_size=self.group_size,
+                                residual_length=self.residual_length,
+                            )
+                        elif self.use_mixed_precision_value:
+                            # Use mixed 4bit/2bit quantization for Value
+                            target_ratio = self.value_target_ratios.get(
+                                name, self.default_value_target_ratio
+                            )
+                            new_layer = ALRDLinear_KIVI_Value_Mixed(
+                                module.in_features, 
+                                module.out_features, 
+                                rank,
+                                bias=module.bias is not None,
+                                target_ratio=target_ratio,
+                                group_size=self.group_size,
+                                residual_length=self.residual_length,
+                            )
+                        else:
+                            # Use uniform quantization for Value
+                            new_layer = ALRDLinear_KIVI_Value(
+                                module.in_features, 
+                                module.out_features, 
+                                rank,
+                                bias=module.bias is not None,
+                                v_bits=self.v_bits,
+                                group_size=self.group_size,
+                                residual_length=self.residual_length,
+                            )
+                    else:
+                        continue
+                else:
+                    # Use legacy quantization
+                    if name.endswith('k_proj'):
+                        new_layer = ALRDLinear_quant_key_v2(
+                            module.in_features, 
+                            module.out_features, 
+                            rank,
+                            bias=module.bias is not None
+                        )
+                    elif name.endswith('v_proj'):
+                        new_layer = ALRDLinear_quant_key_v2(
+                            module.in_features, 
+                            module.out_features, 
+                            rank,
+                            bias=module.bias is not None
+                        )
+                    else:
+                        continue
+                
                 setattr(info["father"], info["name"], new_layer)
-
-
-
-
+    
+    def enable_int8_reconstruction(self, verbose: bool = True):
+        """
+        Enable INT8 value reconstruction for all attention layers.
+        
+        This converts the ALinear weight to INT8 and uses W8A8 INT8 matmul
+        for value reconstruction, which can speed up inference.
+        
+        Args:
+            verbose: Print conversion info
+        
+        Returns:
+            Number of layers converted
+        """
+        if not INT8_SUPPORTED:
+            print(f"[INT8] Warning: INT8 matmul not supported on this platform. Using fake quantization.")
+        
+        converted = 0
+        for name, module in self.model.named_modules():
+            if hasattr(module, 'setup_int8_reconstruction'):
+                module.setup_int8_reconstruction()
+                converted += 1
+        
+        if verbose:
+            print(f"[INT8] Enabled INT8 reconstruction for {converted} attention layers")
+        
+        return converted
+    
+    def disable_int8_reconstruction(self):
+        """Disable INT8 reconstruction for all attention layers."""
+        for name, module in self.model.named_modules():
+            if hasattr(module, 'use_int8_reconstruction'):
+                module.use_int8_reconstruction = False
+        print("[INT8] Disabled INT8 reconstruction")
+    
+    def create_kivi_cache(self) -> KIVILatentCache:
+        """
+        Create a KIVI cache for this model.
+        
+        Usage:
+            model = ALRDLlamaForCausalLM.from_pretrained(...)
+            kivi_cache = model.create_kivi_cache()
+            
+            # Use in generation
+            outputs = model.generate(
+                input_ids,
+                past_key_values=kivi_cache,
+                use_cache=True,
+            )
+        
+        Returns:
+            KIVILatentCache configured with model's KIVI parameters
+        """
+        return create_kivi_cache(
+            k_bits=self.k_bits,
+            v_bits=self.v_bits,
+            group_size=self.group_size,
+            residual_length=self.residual_length,
+        )
+    
+    def create_mixed_precision_cache(
+        self,
+        out_features: int = None,
+    ) -> KIVIMixedPrecisionCache:
+        """
+        Create a mixed-precision KIVI cache for full-rank Value quantization.
+        
+        This cache uses:
+        - Standard KIVI per-channel quantization for Key
+        - Mixed 4bit/2bit quantization for Value based on singular value importance
+        - Per-layer different ranks from truncation_ranks
+        
+        Args:
+            out_features: Output dimension (D). If None, uses head_dim * num_kv_heads
+        
+        Returns:
+            KIVIMixedPrecisionCache configured for this model with per-layer ranks
+        """
+        # Get out_features from model config
+        if out_features is None:
+            out_features = self.config.hidden_size // self.config.num_attention_heads * self.config.num_key_value_heads
+        
+        # Extract per-layer v_proj ranks from truncation_ranks
+        # truncation_ranks format: {"model.layers.0.self_attn.v_proj": 256, ...}
+        layer_original_ranks = {}
+        default_original_rank = out_features // 4  # Default to 25%
+        
+        for name, rank in self.truncation_ranks.items():
+            if 'v_proj' in name:
+                # Extract layer index from name like "model.layers.0.self_attn.v_proj"
+                try:
+                    parts = name.split('.')
+                    for i, part in enumerate(parts):
+                        if part == 'layers' and i + 1 < len(parts):
+                            layer_idx = int(parts[i + 1])
+                            layer_original_ranks[layer_idx] = rank
+                            break
+                except (ValueError, IndexError):
+                    pass
+        
+        if layer_original_ranks:
+            # Use the first layer's rank as default if available
+            default_original_rank = list(layer_original_ranks.values())[0]
+            print(f"[KIVI MixedPrecision] Created cache with {len(layer_original_ranks)} layer-specific ranks")
+            print(f"[KIVI MixedPrecision] Sample ranks: {dict(list(layer_original_ranks.items())[:3])}...")
+        else:
+            print(f"[KIVI MixedPrecision] No v_proj ranks found, using default_original_rank={default_original_rank}")
+        
+        # Get mixed precision options from config
+        match_compression = getattr(self.config, 'mixed_match_compression', True)
+        high_precision_ratio = getattr(self.config, 'mixed_high_precision_ratio', 0.25)
+        high_bits = getattr(self.config, 'mixed_high_bits', 4)
+        low_bits = getattr(self.config, 'mixed_low_bits', 2)
+        
+        return create_mixed_precision_cache(
+            k_bits=self.k_bits,
+            out_features=out_features,
+            layer_original_ranks=layer_original_ranks,
+            default_original_rank=default_original_rank,
+            group_size=self.group_size,
+            residual_length=self.residual_length,
+            match_compression=match_compression,
+            high_precision_ratio=high_precision_ratio,
+            high_bits=high_bits,
+            low_bits=low_bits,
+        )
+    
+    def create_mixed_precision_cache_v2(
+        self,
+        out_features: int = None,
+    ) -> KIVIMixedPrecisionCacheV2:
+        """
+        Create a mixed-precision KIVI cache V2.
+        
+        V2 uses:
+        - Key: 5bit per-channel quantization (configurable via mixed_v2_k_bits)
+        - Value: 6bit/4bit mixed per-token quantization
+        
+        Args:
+            out_features: Output dimension (D). If None, uses head_dim * num_kv_heads
+        
+        Returns:
+            KIVIMixedPrecisionCacheV2 configured for this model
+        """
+        # Get out_features from model config
+        if out_features is None:
+            out_features = self.config.hidden_size // self.config.num_attention_heads * self.config.num_key_value_heads
+        
+        # Extract per-layer v_proj ranks from truncation_ranks
+        layer_original_ranks = {}
+        default_original_rank = out_features // 4
+        
+        for name, rank in self.truncation_ranks.items():
+            if 'v_proj' in name:
+                try:
+                    parts = name.split('.')
+                    for i, part in enumerate(parts):
+                        if part == 'layers' and i + 1 < len(parts):
+                            layer_idx = int(parts[i + 1])
+                            layer_original_ranks[layer_idx] = rank
+                            break
+                except (ValueError, IndexError):
+                    pass
+        
+        if layer_original_ranks:
+            default_original_rank = list(layer_original_ranks.values())[0]
+            print(f"[KIVI V2] Created cache with {len(layer_original_ranks)} layer-specific ranks")
+        
+        # Get V2 options from config
+        k_bits = getattr(self.config, 'mixed_v2_k_bits', 5)
+        original_avg_bits = getattr(self.config, 'mixed_v2_original_avg_bits', 5.0)
+        high_bits = getattr(self.config, 'mixed_v2_high_bits', 6)
+        low_bits = getattr(self.config, 'mixed_v2_low_bits', 4)
+        match_compression = getattr(self.config, 'mixed_match_compression', True)
+        high_precision_ratio = getattr(self.config, 'mixed_high_precision_ratio', 0.25)
+        
+        return create_mixed_precision_cache_v2(
+            k_bits=k_bits,
+            out_features=out_features,
+            layer_original_ranks=layer_original_ranks,
+            default_original_rank=default_original_rank,
+            group_size=self.group_size,
+            residual_length=self.residual_length,
+            match_compression=match_compression,
+            original_avg_bits=original_avg_bits,
+            high_precision_ratio=high_precision_ratio,
+            high_bits=high_bits,
+            low_bits=low_bits,
+        )
+    
+    def generate(
+        self,
+        inputs=None,
+        generation_config=None,
+        logits_processor=None,
+        stopping_criteria=None,
+        prefix_allowed_tokens_fn=None,
+        synced_gpus=None,
+        assistant_model=None,
+        streamer=None,
+        negative_prompt_ids=None,
+        negative_prompt_attention_mask=None,
+        **kwargs,
+    ):
+        """
+        Override generate to automatically use KIVI cache when use_kivi is enabled.
+        
+        This makes the model compatible with lm_eval and other evaluation frameworks
+        that call model.generate() without explicitly passing a KIVI cache.
+        
+        To use KIVI cache, the past_key_values must be an instance of KIVILatentCache
+        or KIVIMixedPrecisionCache (for full-rank mixed precision mode).
+        This is checked in attention via: use_kivi_cache = isinstance(past_key_value, KIVI_CACHE_TYPES)
+        """
+        past_key_values = kwargs.get('past_key_values')
+        
+        # Check if we should use KIVI cache
+        # NOTE: Both KIVILatentCache and KIVIMixedPrecisionCache use fake quantization and do NOT save memory!
+        # Only enable if you explicitly want to test KIVI cache behavior.
+        # For memory-efficient inference, use official KIVI with Triton kernels.
+        use_kivi_cache = getattr(self, 'use_kivi_cache', False)  # Default: disabled
+        
+        if use_kivi_cache and self.use_kivi:
+            if kwargs.get('past_key_values') is None or not isinstance(kwargs.get('past_key_values'), KIVI_CACHE_TYPES):
+                # Determine which cache type to use
+                use_mixed_v2 = getattr(self.config, 'use_mixed_v2', False)
+                
+                if use_mixed_v2:
+                    # V2: Key 5bit, Value 6bit/4bit
+                    kwargs['past_key_values'] = self.create_mixed_precision_cache_v2()
+                    print(f"[KIVI] Auto-created KIVIMixedPrecisionCacheV2 for generate()")
+                elif self.use_fullrank_mixed_value:
+                    # V1: Key 2bit, Value 4bit/2bit
+                    kwargs['past_key_values'] = self.create_mixed_precision_cache()
+                    print(f"[KIVI] Auto-created KIVIMixedPrecisionCache for generate()")
+                else:
+                    # Standard KIVI
+                    kwargs['past_key_values'] = self.create_kivi_cache()
+                    print(f"[KIVI] Auto-created KIVILatentCache for generate()")
+            
+            if 'use_cache' not in kwargs:
+                kwargs['use_cache'] = True
+        
+        # Call parent's generate
+        return super().generate(
+            inputs=inputs,
+            generation_config=generation_config,
+            logits_processor=logits_processor,
+            stopping_criteria=stopping_criteria,
+            prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
+            synced_gpus=synced_gpus,
+            assistant_model=assistant_model,
+            streamer=streamer,
+            negative_prompt_ids=negative_prompt_ids,
+            negative_prompt_attention_mask=negative_prompt_attention_mask,
+            **kwargs,
+        )
+    
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        labels=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        cache_position=None,
+        **kwargs,
+    ):
+        """
+        Override forward to automatically use KIVI cache when use_kivi is enabled.
+        
+        To use KIVI cache, the past_key_values must be an instance of KIVILatentCache
+        or KIVIMixedPrecisionCache (for full-rank mixed precision mode).
+        This is checked in attention via: use_kivi_cache = isinstance(past_key_value, KIVI_CACHE_TYPES)
+        """
+        # Determine if we should use cache
+        use_cache_flag = use_cache if use_cache is not None else self.config.use_cache
+        
+        # Check if we should use KIVI cache
+        # NOTE: Disabled by default because KIVI caches use fake quantization
+        # and does NOT save memory. Enable with model.use_kivi_cache = True
+        use_kivi_cache = getattr(self, 'use_kivi_cache', False)
+        
+        if use_kivi_cache and self.use_kivi and use_cache_flag:
+            if past_key_values is None or not isinstance(past_key_values, KIVI_CACHE_TYPES):
+                # Determine which cache type to use
+                use_mixed_v2 = getattr(self.config, 'use_mixed_v2', False)
+                
+                if use_mixed_v2:
+                    past_key_values = self.create_mixed_precision_cache_v2()
+                elif self.use_fullrank_mixed_value:
+                    past_key_values = self.create_mixed_precision_cache()
+                else:
+                    past_key_values = self.create_kivi_cache()
+        
+        return super().forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            labels=labels,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_position=cache_position,
+            **kwargs,
+        )
