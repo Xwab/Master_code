@@ -264,6 +264,9 @@ class Qwen2KIVIFlashAttention2(Qwen2FlashAttention2):
                 "FlashAttention2 is not compatible with StaticCache."
             )
         
+        # Flash Attention does not support output_attentions
+        output_attentions = False
+        
         bsz, q_len, _ = hidden_states.size()
         
         # Standard Q, K, V projections
@@ -314,6 +317,10 @@ class Qwen2KIVIFlashAttention2(Qwen2FlashAttention2):
             key_states_for_attn = self.key_quantizer(key_states)
             value_states_for_attn = self.value_quantizer(value_states)
         
+        # Repeat K/V for GQA (must be done before transpose for Flash Attention)
+        key_states_for_attn = repeat_kv(key_states_for_attn, self.num_key_value_groups)
+        value_states_for_attn = repeat_kv(value_states_for_attn, self.num_key_value_groups)
+        
         # Flash attention requires [bsz, seq_len, num_heads, head_dim]
         query_states = query_states.transpose(1, 2)
         key_states_for_attn = key_states_for_attn.transpose(1, 2)
@@ -338,6 +345,17 @@ class Qwen2KIVIFlashAttention2(Qwen2FlashAttention2):
         # Import flash attention
         from transformers.modeling_flash_attention_utils import _flash_attention_forward
         
+        # Handle sliding window attention (Qwen2 specific)
+        # Only apply sliding window for layers >= max_window_layers
+        if (
+            getattr(self.config, 'use_sliding_window', False)
+            and getattr(self.config, 'sliding_window', None) is not None
+            and self.layer_idx >= getattr(self.config, 'max_window_layers', 0)
+        ):
+            sliding_window = self.config.sliding_window
+        else:
+            sliding_window = None
+        
         attn_output = _flash_attention_forward(
             query_states,
             key_states_for_attn,
@@ -346,8 +364,9 @@ class Qwen2KIVIFlashAttention2(Qwen2FlashAttention2):
             q_len,
             position_ids=position_ids,
             dropout=dropout_rate,
-            sliding_window=getattr(self, "sliding_window", None),
+            sliding_window=sliding_window,
             is_causal=self.is_causal,
+            use_top_left_mask=self._flash_attn_uses_top_left_mask,
         )
         
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()

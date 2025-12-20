@@ -317,6 +317,7 @@ class LlamaKIVIFlashAttention2(LlamaFlashAttention2):
             value_states_for_attn = self.value_quantizer(value_states)
         
         # Flash attention requires [bsz, seq_len, num_heads, head_dim]
+        # Note: Flash Attention 2 natively supports GQA, so no need for repeat_kv
         query_states = query_states.transpose(1, 2)
         key_states_for_attn = key_states_for_attn.transpose(1, 2)
         value_states_for_attn = value_states_for_attn.transpose(1, 2)
